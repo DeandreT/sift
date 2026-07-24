@@ -3,13 +3,14 @@
 //! model; a refresh fans out list requests.
 
 use egui_extras::{Column, TableBuilder};
-use sift_backend::EntityPath;
+use sift_backend::{EntityPath, NamespaceId};
 use sift_mgmt::MessageCountDetails;
 
 use crate::icons::{Icon, icon};
-use crate::state::{AppAction, AutoRefresh, DashboardState, EntityTree, Loadable};
+use crate::state::{AppAction, AutoRefresh, Connection, DashboardState, Loadable, ScopedEntity};
 
 struct Row {
+    ns: NamespaceId,
     kind: &'static str,
     path: EntityPath,
     display: String,
@@ -19,7 +20,7 @@ struct Row {
 #[allow(clippy::too_many_lines)] // toolbar + table + totals row read best together
 pub fn show(
     ui: &mut egui::Ui,
-    tree: &EntityTree,
+    connections: &[Connection],
     state: &mut DashboardState,
     actions: &mut Vec<AppAction>,
 ) {
@@ -53,7 +54,7 @@ pub fn show(
     });
     ui.separator();
 
-    let rows = collect_rows(tree);
+    let rows = collect_rows(connections);
     if rows.is_empty() {
         ui.add_space(8.0);
         ui.label(
@@ -115,7 +116,10 @@ pub fn show(
                 num(&mut row, total, false);
 
                 if row.response().double_clicked() {
-                    actions.push(AppAction::OpenEntity(r.path.clone()));
+                    actions.push(AppAction::OpenEntity(ScopedEntity::new(
+                        r.ns,
+                        r.path.clone(),
+                    )));
                 }
                 row.response().on_hover_text("Double-click to open");
             });
@@ -135,35 +139,49 @@ pub fn show(
     });
 }
 
-fn collect_rows(tree: &EntityTree) -> Vec<Row> {
+fn collect_rows(connections: &[Connection]) -> Vec<Row> {
     let mut rows = Vec::new();
-    if let Loadable::Loaded(queues) = &tree.queues {
-        for q in queues {
-            rows.push(Row {
-                kind: "queue",
-                path: EntityPath::Queue(q.properties.name.clone()),
-                display: q.properties.name.clone(),
-                counts: q.runtime.count_details,
-            });
-        }
-    }
-    for subs in tree.subscriptions.values() {
-        if let Loadable::Loaded(subs) = subs {
-            for s in subs {
+    // Prefix names with the connection when more than one is open, so
+    // same-named entities across namespaces stay distinguishable.
+    let multi = connections.len() > 1;
+    for conn in connections {
+        let prefix = |name: &str| {
+            if multi {
+                format!("{} · {name}", conn.name)
+            } else {
+                name.to_owned()
+            }
+        };
+        let tree = &conn.tree;
+        if let Loadable::Loaded(queues) = &tree.queues {
+            for q in queues {
                 rows.push(Row {
-                    kind: "subscription",
-                    path: EntityPath::Subscription {
-                        topic: s.properties.topic.clone(),
-                        name: s.properties.name.clone(),
-                    },
-                    display: format!("{}/{}", s.properties.topic, s.properties.name),
-                    counts: s.runtime.count_details,
+                    ns: conn.profile_id,
+                    kind: "queue",
+                    path: EntityPath::Queue(q.properties.name.clone()),
+                    display: prefix(&q.properties.name),
+                    counts: q.runtime.count_details,
                 });
             }
         }
+        for subs in tree.subscriptions.values() {
+            if let Loadable::Loaded(subs) = subs {
+                for s in subs {
+                    rows.push(Row {
+                        ns: conn.profile_id,
+                        kind: "subscription",
+                        path: EntityPath::Subscription {
+                            topic: s.properties.topic.clone(),
+                            name: s.properties.name.clone(),
+                        },
+                        display: prefix(&format!("{}/{}", s.properties.topic, s.properties.name)),
+                        counts: s.runtime.count_details,
+                    });
+                }
+            }
+        }
     }
-    // Filter, then sort by type then name — stable, predictable ordering.
-    rows.retain(|r| tree.filter.matches(&r.display));
+    // Sort by type then name — stable, predictable ordering.
     rows.sort_by(|a, b| a.kind.cmp(b.kind).then_with(|| a.display.cmp(&b.display)));
     rows
 }

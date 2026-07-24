@@ -1,5 +1,7 @@
 //! The eframe application: owns all UI state, drains backend events at the
-//! top of each frame, and renders the panel layout.
+//! top of each frame, and renders the panel layout. Multiple namespace
+//! connections can be live at once; every entity, tab and running op is
+//! qualified by the namespace it belongs to.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -8,17 +10,16 @@ use egui_dock::{DockArea, DockState};
 use egui_toast::{Toast, ToastKind, ToastOptions, Toasts};
 use sift_backend::{
     BackendHandle, Command, Disposition, EntityDescription, EntityInfo, EntityPath, Event,
-    MutationOp,
+    MutationOp, NamespaceId,
 };
 use sift_core::config::{AppConfig, NamespaceProfile, ThemePreference};
 use sift_core::connection::NamespaceConnection;
 use sift_core::secrets::{SecretKind, SecretRef, SecretStore, SecretString};
-use uuid::Uuid;
 
 use crate::logging::LogBuffer;
 use crate::state::{
-    AppAction, AutoRefresh, ConnectionState, DashboardState, EntityTabState, EntityTree, Loadable,
-    PendingConnect, RunningOp,
+    AppAction, AutoRefresh, Connection, DashboardState, EntityTabState, EntityTree, Loadable,
+    PendingConnect, RunningOp, ScopedEntity, TreeFilter,
 };
 use crate::ui::connect_dialog::{ConnectDialog, DialogAction};
 use crate::ui::dialogs::{
@@ -33,12 +34,15 @@ pub struct SiftApp {
     evt_rx: crossbeam_channel::Receiver<Event>,
     config: AppConfig,
     secrets: Box<dyn SecretStore>,
-    conn: ConnectionState,
-    pending_connect: Option<PendingConnect>,
-    tree: EntityTree,
-    open_entities: HashMap<EntityPath, EntityTabState>,
+    /// Every live namespace connection (connected or still connecting).
+    connections: Vec<Connection>,
+    /// In-flight connect attempts, for stale-response filtering.
+    pending_connect: Vec<PendingConnect>,
+    /// One tree filter shared across all connections.
+    filter: TreeFilter,
+    open_entities: HashMap<ScopedEntity, EntityTabState>,
     /// Entities detached into their own OS windows (rendered as viewports).
-    popped_out: Vec<EntityPath>,
+    popped_out: Vec<ScopedEntity>,
     dashboard: DashboardState,
     dock: DockState<TabId>,
     log: LogBuffer,
@@ -72,14 +76,14 @@ impl SiftApp {
         let ctx = cc.egui_ctx.clone();
         let (backend, evt_rx) = sift_backend::spawn(Arc::new(move || ctx.request_repaint()));
 
-        Self {
+        let mut app = Self {
             backend,
             evt_rx,
             config,
             secrets,
-            conn: ConnectionState::default(),
-            pending_connect: None,
-            tree: EntityTree::default(),
+            connections: Vec::new(),
+            pending_connect: Vec::new(),
+            filter: TreeFilter::default(),
             open_entities: HashMap::new(),
             popped_out: Vec::new(),
             dashboard: DashboardState::default(),
@@ -95,11 +99,50 @@ impl SiftApp {
             toasts: Toasts::new()
                 .anchor(egui::Align2::RIGHT_BOTTOM, (-12.0, -12.0))
                 .direction(egui::Direction::BottomUp),
+        };
+        app.auto_connect_startup();
+        app
+    }
+
+    /// Open every profile flagged for auto-connect at launch.
+    fn auto_connect_startup(&mut self) {
+        let profiles: Vec<NamespaceProfile> = self
+            .config
+            .profiles
+            .iter()
+            .filter(|p| p.auto_connect)
+            .cloned()
+            .collect();
+        for profile in profiles {
+            match self
+                .secrets
+                .get(&SecretRef::new(profile.id, SecretKind::ConnectionString))
+            {
+                Ok(Some(secret)) => self.start_connect(profile, secret),
+                Ok(None) => {
+                    tracing::warn!("auto-connect '{}' skipped: no stored secret", profile.name);
+                }
+                Err(e) => tracing::warn!("auto-connect '{}' skipped: {e}", profile.name),
+            }
         }
     }
 
-    fn namespace_id(&self) -> Option<Uuid> {
-        self.conn.namespace_id()
+    // ---- connection lookup helpers --------------------------------------
+
+    fn connection(&self, ns: NamespaceId) -> Option<&Connection> {
+        self.connections.iter().find(|c| c.profile_id == ns)
+    }
+
+    fn connection_mut(&mut self, ns: NamespaceId) -> Option<&mut Connection> {
+        self.connections.iter_mut().find(|c| c.profile_id == ns)
+    }
+
+    fn tree_mut(&mut self, ns: NamespaceId) -> Option<&mut EntityTree> {
+        self.connection_mut(ns).map(|c| &mut c.tree)
+    }
+
+    fn is_connected(&self, ns: NamespaceId) -> bool {
+        self.connection(ns).is_some_and(Connection::is_connected)
     }
 
     // ---- backend events -------------------------------------------------
@@ -114,92 +157,115 @@ impl SiftApp {
     fn apply_event(&mut self, event: Event) {
         match event {
             Event::Connected { req, ns, result } => {
-                let Some(pending) = self.pending_connect.take_if(|p| p.req == req) else {
+                let Some(idx) = self.pending_connect.iter().position(|p| p.req == req) else {
                     tracing::debug!("ignoring stale connect response");
                     return;
                 };
+                let pending = self.pending_connect.remove(idx);
                 match result {
                     Ok(info) => {
                         self.toast(ToastKind::Success, format!("Connected to {}", info.name));
-                        self.conn = ConnectionState::Connected {
-                            profile_id: ns,
-                            name: pending.name,
-                            info,
-                        };
-                        self.tree.clear();
-                        self.open_entities.clear();
-                        self.popped_out.clear();
-                        self.running_ops.clear();
+                        if let Some(conn) = self.connection_mut(ns) {
+                            conn.name = pending.name;
+                            conn.info = Some(info);
+                            conn.tree.clear();
+                        } else {
+                            self.connections.push(Connection {
+                                profile_id: ns,
+                                name: pending.name,
+                                info: Some(info),
+                                tree: EntityTree::default(),
+                            });
+                        }
                     }
                     Err(e) => {
                         if let Some(detail) = &e.detail {
                             tracing::debug!("connect failure detail: {detail}");
                         }
                         self.toast(ToastKind::Error, e.message);
-                        self.conn = ConnectionState::Disconnected;
+                        // Drop the connecting placeholder; keep any other connection.
+                        self.connections
+                            .retain(|c| c.profile_id != ns || c.is_connected());
                     }
                 }
             }
-            Event::Disconnected { ns } => {
-                if self.namespace_id() == Some(ns) {
-                    self.conn = ConnectionState::Disconnected;
-                    self.tree.clear();
-                    self.open_entities.clear();
-                    self.popped_out.clear();
-                    self.running_ops.clear();
-                    self.close_entity_tabs();
+            Event::Disconnected { ns } => self.remove_connection(ns),
+            Event::Queues { ns, result, .. } => {
+                let loadable = load_result(result, &mut self.toasts);
+                if let Some(tree) = self.tree_mut(ns) {
+                    tree.queues = loadable;
                 }
             }
-            Event::Queues { result, .. } => {
-                self.tree.queues = load_result(result, &mut self.toasts);
-            }
-            Event::Topics { result, .. } => {
-                self.tree.topics = load_result(result, &mut self.toasts);
+            Event::Topics { ns, result, .. } => {
+                let loadable = load_result(result, &mut self.toasts);
+                if let Some(tree) = self.tree_mut(ns) {
+                    tree.topics = loadable;
+                }
                 // A dashboard refresh needs every subscription's counts, so
-                // fan out subscription loads once the topic list is in.
-                if self.dashboard.wants_subscriptions
-                    && let Loadable::Loaded(topics) = &self.tree.topics
-                {
-                    self.dashboard.wants_subscriptions = false;
-                    let names: Vec<String> =
-                        topics.iter().map(|t| t.properties.name.clone()).collect();
-                    for topic in names {
-                        self.run_action(AppAction::LoadSubscriptions(topic));
+                // fan out subscription loads once this namespace's topics land.
+                if self.dashboard.wants_subscriptions.contains(&ns) {
+                    let names = match self.connection(ns).map(|c| &c.tree.topics) {
+                        Some(Loadable::Loaded(topics)) => Some(
+                            topics
+                                .iter()
+                                .map(|t| t.properties.name.clone())
+                                .collect::<Vec<_>>(),
+                        ),
+                        _ => None,
+                    };
+                    if let Some(names) = names {
+                        self.dashboard.wants_subscriptions.remove(&ns);
+                        for topic in names {
+                            self.run_action(AppAction::LoadSubscriptions { ns, topic });
+                        }
                     }
                 }
             }
-            Event::Subscriptions { topic, result, .. } => {
-                self.tree
-                    .subscriptions
-                    .insert(topic, load_result(result, &mut self.toasts));
+            Event::Subscriptions {
+                ns, topic, result, ..
+            } => {
+                let loadable = load_result(result, &mut self.toasts);
+                if let Some(tree) = self.tree_mut(ns) {
+                    tree.subscriptions.insert(topic, loadable);
+                }
             }
             Event::Rules {
+                ns,
                 topic,
                 subscription,
                 result,
                 ..
             } => {
-                self.tree
-                    .rules
-                    .insert((topic, subscription), load_result(result, &mut self.toasts));
+                let loadable = load_result(result, &mut self.toasts);
+                if let Some(tree) = self.tree_mut(ns) {
+                    tree.rules.insert((topic, subscription), loadable);
+                }
             }
-            Event::Entity { path, result, .. } => {
+            Event::Entity {
+                ns, path, result, ..
+            } => {
                 let info = match result {
                     Ok(info) => Loadable::Loaded(info),
                     Err(e) => Loadable::Failed(e.message),
                 };
-                self.tab_state(&path).info = info;
+                self.tab_state(&ScopedEntity::new(ns, path)).info = info;
             }
             Event::Mutated {
-                op, path, result, ..
-            } => self.apply_mutation_event(op, path, result),
+                ns,
+                op,
+                path,
+                result,
+                ..
+            } => self.apply_mutation_event(ns, op, path, result),
             Event::Messages {
+                ns,
                 source,
                 from_seq,
                 result,
                 ..
             } => {
-                let view = self.tab_state(&source.entity).view_mut(source.dead_letter);
+                let scoped = ScopedEntity::new(ns, source.entity.clone());
+                let view = self.tab_state(&scoped).view_mut(source.dead_letter);
                 view.loading = false;
                 match result {
                     Ok(mut messages) => {
@@ -215,6 +281,7 @@ impl SiftApp {
                 }
             }
             Event::Settled {
+                ns,
                 source,
                 lock_token,
                 disposition,
@@ -222,7 +289,8 @@ impl SiftApp {
                 ..
             } => match result {
                 Ok(()) => {
-                    let view = self.tab_state(&source.entity).view_mut(source.dead_letter);
+                    let scoped = ScopedEntity::new(ns, source.entity.clone());
+                    let view = self.tab_state(&scoped).view_mut(source.dead_letter);
                     if disposition == Disposition::Abandon {
                         // The message stays; our lock is just gone.
                         if let Some(row) = view
@@ -240,11 +308,12 @@ impl SiftApp {
                         format!("{} the message", disposition.verb()),
                     );
                     // Counts changed; refresh the overview.
-                    self.run_action(AppAction::RefreshEntity(source.entity));
+                    self.run_action(AppAction::RefreshEntity(scoped));
                 }
                 Err(e) => self.toast(ToastKind::Error, e.message),
             },
             Event::Sent {
+                ns,
                 target,
                 count,
                 result,
@@ -256,31 +325,40 @@ impl SiftApp {
                         ToastKind::Success,
                         format!("{verb} {count} message(s) to '{target}'"),
                     );
-                    if self.open_entities.contains_key(&target) {
-                        self.run_action(AppAction::RefreshEntity(target));
+                    let scoped = ScopedEntity::new(ns, target);
+                    if self.open_entities.contains_key(&scoped) {
+                        self.run_action(AppAction::RefreshEntity(scoped));
                     }
                 }
                 Err(e) => self.toast(ToastKind::Error, e.message),
             },
-            Event::ScheduledCancelled { target, result, .. } => match result {
+            Event::ScheduledCancelled {
+                ns, target, result, ..
+            } => match result {
                 Ok(()) => {
                     self.toast(ToastKind::Success, "Cancelled the scheduled message");
-                    if self.open_entities.contains_key(&target) {
-                        self.run_action(AppAction::RefreshEntity(target));
+                    let scoped = ScopedEntity::new(ns, target);
+                    if self.open_entities.contains_key(&scoped) {
+                        self.run_action(AppAction::RefreshEntity(scoped));
                     }
                 }
                 Err(e) => self.toast(ToastKind::Error, e.message),
             },
-            Event::NamespaceTransfer { result, .. } => match result {
+            Event::NamespaceTransfer { ns, result, .. } => match result {
                 Ok(summary) => {
                     tracing::info!("{summary}");
                     self.toast(ToastKind::Success, summary);
-                    self.tree.clear(); // imported entities may have appeared
+                    if let Some(tree) = self.tree_mut(ns) {
+                        tree.clear(); // imported entities may have appeared
+                    }
                 }
                 Err(e) => self.toast(ToastKind::Error, e.message),
             },
-            Event::Session { source, result, .. } => {
-                let view = &mut self.tab_state(&source.entity).sessions;
+            Event::Session {
+                ns, source, result, ..
+            } => {
+                let scoped = ScopedEntity::new(ns, source.entity.clone());
+                let view = &mut self.tab_state(&scoped).sessions;
                 view.loading = false;
                 match result {
                     Ok(snapshot) => {
@@ -292,6 +370,7 @@ impl SiftApp {
             }
             Event::OpProgress {
                 op,
+                ns,
                 kind,
                 done,
                 target,
@@ -301,6 +380,7 @@ impl SiftApp {
                 } else {
                     self.running_ops.push(RunningOp {
                         op,
+                        ns,
                         kind,
                         done,
                         target,
@@ -309,6 +389,7 @@ impl SiftApp {
             }
             Event::OpFinished {
                 op,
+                ns,
                 result,
                 cancelled,
             } => {
@@ -316,7 +397,7 @@ impl SiftApp {
                     // Re-derive which entity to refresh from the target label.
                     self.open_entities
                         .keys()
-                        .find(|p| o.target.starts_with(p.name()))
+                        .find(|s| s.ns == ns && o.target.starts_with(s.path.name()))
                         .cloned()
                 });
                 self.running_ops.retain(|o| o.op != op);
@@ -338,22 +419,35 @@ impl SiftApp {
                     }
                     Err(e) => self.toast(ToastKind::Error, e.message),
                 }
-                if let Some(path) = entity {
-                    self.run_action(AppAction::RefreshEntity(path));
+                if let Some(scoped) = entity {
+                    self.run_action(AppAction::RefreshEntity(scoped));
                 }
             }
         }
     }
 
-    /// Tab state for an entity, created on demand.
-    fn tab_state(&mut self, path: &EntityPath) -> &mut EntityTabState {
+    /// Forget a connection and everything scoped to it.
+    fn remove_connection(&mut self, ns: NamespaceId) {
+        self.connections.retain(|c| c.profile_id != ns);
+        self.pending_connect.retain(|p| p.profile_id != ns);
+        self.open_entities.retain(|scoped, _| scoped.ns != ns);
+        self.popped_out.retain(|scoped| scoped.ns != ns);
+        self.running_ops.retain(|o| o.ns != ns);
+        self.dashboard.wants_subscriptions.remove(&ns);
+        self.close_entity_tabs_for(ns);
+    }
+
+    /// Tab state for a scoped entity, created on demand.
+    fn tab_state(&mut self, scoped: &ScopedEntity) -> &mut EntityTabState {
+        let batch = self.config.ui.peek_batch;
         self.open_entities
-            .entry(path.clone())
-            .or_insert_with(|| EntityTabState::new(self.config.ui.peek_batch))
+            .entry(scoped.clone())
+            .or_insert_with(|| EntityTabState::new(batch))
     }
 
     fn apply_mutation_event(
         &mut self,
+        ns: NamespaceId,
         op: MutationOp,
         path: EntityPath,
         result: Result<Option<EntityInfo>, sift_backend::BackendError>,
@@ -370,22 +464,25 @@ impl SiftApp {
                     format!("{verb} {} '{path}'", path.kind()),
                 );
 
+                let scoped = ScopedEntity::new(ns, path.clone());
                 match op {
                     MutationOp::Deleted => {
-                        self.open_entities.remove(&path);
-                        if let Some(location) = self.dock.find_tab(&TabId::Entity(path.clone())) {
+                        self.open_entities.remove(&scoped);
+                        if let Some(location) = self.dock.find_tab(&TabId::Entity(scoped)) {
                             self.dock.remove_tab(location);
                         }
                     }
                     MutationOp::Created | MutationOp::Updated => {
                         if let Some(info) = info {
-                            self.tab_state(&path).info = Loadable::Loaded(info);
+                            self.tab_state(&scoped).info = Loadable::Loaded(info);
                         }
                     }
                 }
                 // Reload the list that contains the entity so the tree agrees.
-                self.tree.invalidate_list_for(&path);
-                self.reload_list_for(&path);
+                if let Some(tree) = self.tree_mut(ns) {
+                    tree.invalidate_list_for(&path);
+                }
+                self.reload_list_for(ns, &path);
             }
             Err(e) => {
                 if let Some(detail) = &e.detail {
@@ -393,33 +490,41 @@ impl SiftApp {
                 }
                 self.toast(ToastKind::Error, e.message);
                 // The service state is unknown; refresh an open detail tab.
-                if self.open_entities.contains_key(&path) {
-                    self.run_action(AppAction::RefreshEntity(path));
+                let scoped = ScopedEntity::new(ns, path);
+                if self.open_entities.contains_key(&scoped) {
+                    self.run_action(AppAction::RefreshEntity(scoped));
                 }
             }
         }
     }
 
-    fn reload_list_for(&mut self, path: &EntityPath) {
+    fn reload_list_for(&mut self, ns: NamespaceId, path: &EntityPath) {
         let action = match path {
-            EntityPath::Queue(_) => AppAction::LoadQueues,
-            EntityPath::Topic(_) => AppAction::LoadTopics,
-            EntityPath::Subscription { topic, .. } => AppAction::LoadSubscriptions(topic.clone()),
+            EntityPath::Queue(_) => AppAction::LoadQueues(ns),
+            EntityPath::Topic(_) => AppAction::LoadTopics(ns),
+            EntityPath::Subscription { topic, .. } => AppAction::LoadSubscriptions {
+                ns,
+                topic: topic.clone(),
+            },
             EntityPath::Rule {
                 topic,
                 subscription,
                 ..
-            } => AppAction::LoadRules(topic.clone(), subscription.clone()),
+            } => AppAction::LoadRules {
+                ns,
+                topic: topic.clone(),
+                subscription: subscription.clone(),
+            },
         };
         self.run_action(action);
     }
 
-    fn close_entity_tabs(&mut self) {
+    fn close_entity_tabs_for(&mut self, ns: NamespaceId) {
         let entity_tabs: Vec<TabId> = self
             .dock
             .iter_all_tabs()
             .map(|(_, tab)| tab.clone())
-            .filter(|tab| matches!(tab, TabId::Entity(_)))
+            .filter(|tab| matches!(tab, TabId::Entity(s) if s.ns == ns))
             .collect();
         for tab in entity_tabs {
             if let Some(location) = self.dock.find_tab(&tab) {
@@ -432,58 +537,74 @@ impl SiftApp {
 
     #[allow(clippy::too_many_lines)] // one arm per action variant
     fn run_action(&mut self, action: AppAction) {
-        let ns = self.namespace_id();
         match action {
             AppAction::OpenConnectDialog => {
                 if self.connect_dialog.is_none() {
-                    self.connect_dialog = Some(match &self.conn {
-                        ConnectionState::Connected {
-                            profile_id, name, ..
-                        } => ConnectDialog::for_profile(*profile_id, name.clone()),
-                        _ => self
-                            .config
+                    self.connect_dialog = Some(
+                        self.config
                             .profiles
                             .first()
-                            .map(|p| ConnectDialog::for_profile(p.id, p.name.clone()))
+                            .map(|p| {
+                                ConnectDialog::for_profile(p.id, p.name.clone(), p.auto_connect)
+                            })
                             .unwrap_or_default(),
-                    });
+                    );
                 }
             }
-            AppAction::Disconnect => {
-                if let Some(ns) = ns {
-                    self.backend.send(Command::Disconnect { ns });
-                }
+            AppAction::Disconnect(ns) => {
+                self.backend.send(Command::Disconnect { ns });
             }
             AppAction::ImportLegacyProfiles => self.import_legacy_profiles(),
-            AppAction::LoadQueues => {
-                if let Some(ns) = ns {
-                    self.tree.queues = Loadable::Loading;
+            AppAction::LoadQueues(ns) => {
+                let exists = if let Some(tree) = self.tree_mut(ns) {
+                    tree.queues = Loadable::Loading;
+                    true
+                } else {
+                    false
+                };
+                if exists {
                     let req = self.backend.next_request();
                     self.backend.send(Command::ListQueues { req, ns });
                 }
             }
-            AppAction::LoadTopics => {
-                if let Some(ns) = ns {
-                    self.tree.topics = Loadable::Loading;
+            AppAction::LoadTopics(ns) => {
+                let exists = if let Some(tree) = self.tree_mut(ns) {
+                    tree.topics = Loadable::Loading;
+                    true
+                } else {
+                    false
+                };
+                if exists {
                     let req = self.backend.next_request();
                     self.backend.send(Command::ListTopics { req, ns });
                 }
             }
-            AppAction::LoadSubscriptions(topic) => {
-                if let Some(ns) = ns {
-                    self.tree
-                        .subscriptions
-                        .insert(topic.clone(), Loadable::Loading);
+            AppAction::LoadSubscriptions { ns, topic } => {
+                let exists = if let Some(tree) = self.tree_mut(ns) {
+                    tree.subscriptions.insert(topic.clone(), Loadable::Loading);
+                    true
+                } else {
+                    false
+                };
+                if exists {
                     let req = self.backend.next_request();
                     self.backend
                         .send(Command::ListSubscriptions { req, ns, topic });
                 }
             }
-            AppAction::LoadRules(topic, subscription) => {
-                if let Some(ns) = ns {
-                    self.tree
-                        .rules
+            AppAction::LoadRules {
+                ns,
+                topic,
+                subscription,
+            } => {
+                let exists = if let Some(tree) = self.tree_mut(ns) {
+                    tree.rules
                         .insert((topic.clone(), subscription.clone()), Loadable::Loading);
+                    true
+                } else {
+                    false
+                };
+                if exists {
                     let req = self.backend.next_request();
                     self.backend.send(Command::ListRules {
                         req,
@@ -493,50 +614,52 @@ impl SiftApp {
                     });
                 }
             }
-            AppAction::RefreshTree => self.tree.clear(),
-            // Docking a popped-out entity is the same as opening it.
-            AppAction::OpenEntity(path) | AppAction::DockEntity(path) => {
-                self.open_entity_tab(&path);
+            AppAction::RefreshTree(ns) => {
+                if let Some(tree) = self.tree_mut(ns) {
+                    tree.clear();
+                }
             }
-            AppAction::RefreshEntity(path) => {
-                if let Some(ns) = ns {
-                    self.tab_state(&path).info = Loadable::Loading;
+            // Docking a popped-out entity is the same as opening it.
+            AppAction::OpenEntity(scoped) | AppAction::DockEntity(scoped) => {
+                self.open_entity_tab(&scoped);
+            }
+            AppAction::RefreshEntity(scoped) => {
+                if self.is_connected(scoped.ns) {
+                    let ns = scoped.ns;
+                    let path = scoped.path.clone();
+                    self.tab_state(&scoped).info = Loadable::Loading;
                     let req = self.backend.next_request();
                     self.backend.send(Command::GetEntity { req, ns, path });
                 }
             }
-            AppAction::UpdateEntity(info) => {
-                if let Some(ns) = ns {
-                    let desc = description_of(&info);
-                    let req = self.backend.next_request();
-                    self.backend.send(Command::UpdateEntity { req, ns, desc });
-                }
+            AppAction::UpdateEntity { ns, info } => {
+                let desc = description_of(&info);
+                let req = self.backend.next_request();
+                self.backend.send(Command::UpdateEntity { req, ns, desc });
             }
-            AppAction::OpenCreateDialog(kind) => {
-                self.create_dialog = Some(CreateDialog::new(kind));
+            AppAction::OpenCreateDialog { ns, kind } => {
+                self.create_dialog = Some(CreateDialog::new(ns, kind));
             }
-            AppAction::RequestDelete(path) => {
+            AppAction::RequestDelete(scoped) => {
                 self.confirm = Some(ConfirmDialog::new(
-                    PendingConfirm::Delete(path),
+                    PendingConfirm::Delete(scoped),
                     self.config.ui.confirm_delete_typed_name,
                 ));
             }
-            AppAction::RequestPurge(source) => {
+            AppAction::RequestPurge { ns, source } => {
                 self.confirm = Some(ConfirmDialog::new(
-                    PendingConfirm::Purge(source),
+                    PendingConfirm::Purge { ns, source },
                     self.config.ui.confirm_delete_typed_name,
                 ));
             }
-            AppAction::ResubmitAll { source, target } => {
-                if let Some(ns) = ns {
-                    let op = self.backend.next_op();
-                    self.backend.send(Command::StartResubmit {
-                        op,
-                        ns,
-                        source,
-                        target,
-                    });
-                }
+            AppAction::ResubmitAll { ns, source, target } => {
+                let op = self.backend.next_op();
+                self.backend.send(Command::StartResubmit {
+                    op,
+                    ns,
+                    source,
+                    target,
+                });
             }
             AppAction::CancelOp(op) => {
                 self.backend.send(Command::CancelOp(op));
@@ -551,11 +674,19 @@ impl SiftApp {
                 self.run_action(AppAction::RefreshDashboard);
             }
             AppAction::RefreshDashboard => {
-                // Load queues + topics now; subscriptions follow once topics
-                // arrive (see the Topics event handler).
-                self.dashboard.wants_subscriptions = true;
-                self.run_action(AppAction::LoadQueues);
-                self.run_action(AppAction::LoadTopics);
+                // Load queues + topics for every connection now; subscriptions
+                // follow once each namespace's topics arrive (see Topics).
+                let nss: Vec<NamespaceId> = self
+                    .connections
+                    .iter()
+                    .filter(|c| c.is_connected())
+                    .map(|c| c.profile_id)
+                    .collect();
+                for ns in nss {
+                    self.dashboard.wants_subscriptions.insert(ns);
+                    self.run_action(AppAction::LoadQueues(ns));
+                    self.run_action(AppAction::LoadTopics(ns));
+                }
                 self.schedule_dashboard_refresh();
             }
             AppAction::SetDashboardAutoRefresh(mode) => {
@@ -563,137 +694,144 @@ impl SiftApp {
                 self.schedule_dashboard_refresh();
             }
             AppAction::CancelScheduled {
+                ns,
                 target,
                 sequence_number,
             } => {
-                if let Some(ns) = ns {
-                    let req = self.backend.next_request();
-                    self.backend.send(Command::CancelScheduled {
-                        req,
-                        ns,
-                        target,
-                        sequence_number,
-                    });
-                }
+                let req = self.backend.next_request();
+                self.backend.send(Command::CancelScheduled {
+                    req,
+                    ns,
+                    target,
+                    sequence_number,
+                });
             }
             AppAction::ReceiveDeferred {
+                ns,
                 source,
                 sequence_numbers,
             } => {
-                if let Some(ns) = ns {
-                    let view = self.tab_state(&source.entity).view_mut(source.dead_letter);
-                    view.loading = true;
-                    let req = self.backend.next_request();
-                    self.backend.send(Command::ReceiveDeferred {
-                        req,
-                        ns,
-                        source,
-                        sequence_numbers,
-                    });
-                }
+                let scoped = ScopedEntity::new(ns, source.entity.clone());
+                self.tab_state(&scoped).view_mut(source.dead_letter).loading = true;
+                let req = self.backend.next_request();
+                self.backend.send(Command::ReceiveDeferred {
+                    req,
+                    ns,
+                    source,
+                    sequence_numbers,
+                });
             }
-            AppAction::ExportNamespace => self.export_namespace(),
-            AppAction::ImportNamespace { overwrite } => self.import_namespace(overwrite),
+            AppAction::ExportNamespace(ns) => self.export_namespace(ns),
+            AppAction::ImportNamespace { ns, overwrite } => self.import_namespace(ns, overwrite),
             AppAction::BrowseSession {
+                ns,
                 source,
                 session_id,
                 count,
             } => {
-                if let Some(ns) = ns {
-                    let view = &mut self.tab_state(&source.entity).sessions;
+                let scoped = ScopedEntity::new(ns, source.entity.clone());
+                {
+                    let view = &mut self.tab_state(&scoped).sessions;
                     view.loading = true;
                     view.error = None;
-                    let req = self.backend.next_request();
-                    self.backend.send(Command::BrowseSession {
-                        req,
-                        ns,
-                        source,
-                        session_id,
-                        count,
-                    });
                 }
+                let req = self.backend.next_request();
+                self.backend.send(Command::BrowseSession {
+                    req,
+                    ns,
+                    source,
+                    session_id,
+                    count,
+                });
             }
             AppAction::PeekMessages {
+                ns,
                 source,
                 from_seq,
                 count,
             } => {
-                if let Some(ns) = ns {
-                    let view = self.tab_state(&source.entity).view_mut(source.dead_letter);
+                let scoped = ScopedEntity::new(ns, source.entity.clone());
+                {
+                    let view = self.tab_state(&scoped).view_mut(source.dead_letter);
                     view.loading = true;
                     view.error = None;
-                    let req = self.backend.next_request();
-                    self.backend.send(Command::PeekMessages {
-                        req,
-                        ns,
-                        source,
-                        from_seq,
-                        count,
-                    });
                 }
+                let req = self.backend.next_request();
+                self.backend.send(Command::PeekMessages {
+                    req,
+                    ns,
+                    source,
+                    from_seq,
+                    count,
+                });
             }
             AppAction::ReceiveMessages {
+                ns,
                 source,
                 mode,
                 count,
             } => {
-                if let Some(ns) = ns {
-                    let view = self.tab_state(&source.entity).view_mut(source.dead_letter);
+                let scoped = ScopedEntity::new(ns, source.entity.clone());
+                {
+                    let view = self.tab_state(&scoped).view_mut(source.dead_letter);
                     view.loading = true;
                     view.error = None;
-                    let req = self.backend.next_request();
-                    self.backend.send(Command::ReceiveMessages {
-                        req,
-                        ns,
-                        source,
-                        mode,
-                        count,
-                    });
                 }
+                let req = self.backend.next_request();
+                self.backend.send(Command::ReceiveMessages {
+                    req,
+                    ns,
+                    source,
+                    mode,
+                    count,
+                });
             }
             AppAction::Settle {
+                ns,
                 source,
                 lock_token,
                 disposition,
             } => {
-                if let Some(ns) = ns {
-                    let req = self.backend.next_request();
-                    self.backend.send(Command::SettleMessage {
-                        req,
-                        ns,
-                        source,
-                        lock_token,
-                        disposition,
-                    });
-                }
-            }
-            AppAction::OpenSendDialog { target, prefill } => {
-                self.send_dialog = Some(match prefill {
-                    Some(outbound) => SendDialog::prefilled(target, *outbound),
-                    None => SendDialog::new(target),
+                let req = self.backend.next_request();
+                self.backend.send(Command::SettleMessage {
+                    req,
+                    ns,
+                    source,
+                    lock_token,
+                    disposition,
                 });
             }
-            AppAction::PopOutEntity(path) => {
-                if let Some(location) = self.dock.find_tab(&TabId::Entity(path.clone())) {
+            AppAction::OpenSendDialog {
+                ns,
+                target,
+                prefill,
+            } => {
+                self.send_dialog = Some(match prefill {
+                    Some(outbound) => SendDialog::prefilled(ns, target, *outbound),
+                    None => SendDialog::new(ns, target),
+                });
+            }
+            AppAction::PopOutEntity(scoped) => {
+                if let Some(location) = self.dock.find_tab(&TabId::Entity(scoped.clone())) {
                     self.dock.remove_tab(location);
                 }
-                if !self.popped_out.contains(&path) {
-                    self.popped_out.push(path);
+                if !self.popped_out.contains(&scoped) {
+                    self.popped_out.push(scoped);
                 }
             }
         }
     }
 
-    fn open_entity_tab(&mut self, path: &EntityPath) {
+    fn open_entity_tab(&mut self, scoped: &ScopedEntity) {
         // If it's currently a separate window, reattaching brings it back.
-        self.popped_out.retain(|p| p != path);
-        let tab = TabId::Entity(path.clone());
+        self.popped_out.retain(|s| s != scoped);
+        let tab = TabId::Entity(scoped.clone());
         if let Some(location) = self.dock.find_tab(&tab) {
             if let Err(e) = self.dock.set_active_tab(location) {
                 tracing::debug!("could not focus tab: {e:?}");
             }
         } else {
-            self.tab_state(path);
+            self.tab_state(scoped);
             self.dock.push_to_focused_leaf(tab);
         }
     }
@@ -779,6 +917,7 @@ impl SiftApp {
         };
         profile.endpoint = Some(conn.endpoint.clone());
         profile.transport = conn.transport;
+        profile.auto_connect = dialog.auto_connect;
 
         if newly_typed
             && let Err(e) = self.secrets.set(
@@ -801,14 +940,22 @@ impl SiftApp {
 
     fn start_connect(&mut self, profile: NamespaceProfile, secret: SecretString) {
         let req = self.backend.next_request();
-        self.conn = ConnectionState::Connecting {
+        // Replace any earlier attempt for this profile.
+        self.pending_connect.retain(|p| p.profile_id != profile.id);
+        self.pending_connect.push(PendingConnect {
+            req,
             profile_id: profile.id,
             name: profile.name.clone(),
-        };
-        self.pending_connect = Some(PendingConnect {
-            req,
-            name: profile.name.clone(),
         });
+        // Show it as connecting in the tree immediately.
+        if let Some(conn) = self.connection_mut(profile.id) {
+            conn.name.clone_from(&profile.name);
+            conn.info = None;
+            conn.tree.clear();
+        } else {
+            self.connections
+                .push(Connection::connecting(profile.id, profile.name.clone()));
+        }
         tracing::info!("connecting to {}…", profile.name);
         self.backend.send(Command::Connect {
             req,
@@ -851,14 +998,14 @@ impl SiftApp {
         }
     }
 
-    fn export_namespace(&mut self) {
-        let Some(ns) = self.namespace_id() else {
-            return;
-        };
-        let default_name = match &self.conn {
-            ConnectionState::Connected { info, .. } => format!("{}-export.json", info.name),
-            _ => "sift-export.json".to_owned(),
-        };
+    fn export_namespace(&mut self, ns: NamespaceId) {
+        let default_name = self
+            .connection(ns)
+            .and_then(|c| c.info.as_ref())
+            .map_or_else(
+                || "sift-export.json".to_owned(),
+                |info| format!("{}-export.json", info.name),
+            );
         let Some(path) = rfd::FileDialog::new()
             .set_title("Export namespace entities")
             .add_filter("JSON", &["json"])
@@ -873,10 +1020,7 @@ impl SiftApp {
         self.toast(ToastKind::Info, "Exporting…");
     }
 
-    fn import_namespace(&mut self, overwrite: bool) {
-        let Some(ns) = self.namespace_id() else {
-            return;
-        };
+    fn import_namespace(&mut self, ns: NamespaceId, overwrite: bool) {
         let Some(path) = rfd::FileDialog::new()
             .set_title("Import namespace entities")
             .add_filter("JSON", &["json"])
@@ -915,43 +1059,66 @@ impl SiftApp {
     // ---- layout ----------------------------------------------------------
 
     fn menu_bar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<AppAction>) {
+        // Snapshot connected namespaces so the menu closures don't borrow
+        // `self.connections` while we also touch other `self` fields.
+        let conns: Vec<(NamespaceId, String)> = self
+            .connections
+            .iter()
+            .filter(|c| c.is_connected())
+            .map(|c| (c.profile_id, c.name.clone()))
+            .collect();
+        let any_connected = !conns.is_empty();
+
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
                 if ui.button("Connect…").clicked() {
                     actions.push(AppAction::OpenConnectDialog);
                     ui.close();
                 }
-                let connected = matches!(self.conn, ConnectionState::Connected { .. });
-                if ui
-                    .add_enabled(connected, egui::Button::new("Disconnect"))
-                    .clicked()
-                {
-                    actions.push(AppAction::Disconnect);
-                    ui.close();
-                }
-                ui.separator();
-                let connected = matches!(self.conn, ConnectionState::Connected { .. });
-                if ui
-                    .add_enabled(connected, egui::Button::new("Export entities…"))
-                    .clicked()
-                {
-                    actions.push(AppAction::ExportNamespace);
-                    ui.close();
-                }
-                ui.menu_button("Import entities", |ui| {
-                    if ui
-                        .add_enabled(connected, egui::Button::new("Create missing only"))
-                        .clicked()
-                    {
-                        actions.push(AppAction::ImportNamespace { overwrite: false });
-                        ui.close();
+                ui.menu_button("Disconnect", |ui| {
+                    if conns.is_empty() {
+                        ui.label(egui::RichText::new("no connections").weak());
                     }
-                    if ui
-                        .add_enabled(connected, egui::Button::new("Create and overwrite"))
-                        .clicked()
-                    {
-                        actions.push(AppAction::ImportNamespace { overwrite: true });
-                        ui.close();
+                    for (ns, name) in &conns {
+                        if ui.button(name).clicked() {
+                            actions.push(AppAction::Disconnect(*ns));
+                            ui.close();
+                        }
+                    }
+                });
+                ui.separator();
+                ui.menu_button("Export entities", |ui| {
+                    if conns.is_empty() {
+                        ui.label(egui::RichText::new("no connections").weak());
+                    }
+                    for (ns, name) in &conns {
+                        if ui.button(name).clicked() {
+                            actions.push(AppAction::ExportNamespace(*ns));
+                            ui.close();
+                        }
+                    }
+                });
+                ui.menu_button("Import entities", |ui| {
+                    if conns.is_empty() {
+                        ui.label(egui::RichText::new("no connections").weak());
+                    }
+                    for (ns, name) in &conns {
+                        ui.menu_button(name, |ui| {
+                            if ui.button("Create missing only").clicked() {
+                                actions.push(AppAction::ImportNamespace {
+                                    ns: *ns,
+                                    overwrite: false,
+                                });
+                                ui.close();
+                            }
+                            if ui.button("Create and overwrite").clicked() {
+                                actions.push(AppAction::ImportNamespace {
+                                    ns: *ns,
+                                    overwrite: true,
+                                });
+                                ui.close();
+                            }
+                        });
                     }
                 });
                 ui.separator();
@@ -965,9 +1132,8 @@ impl SiftApp {
                 }
             });
             ui.menu_button("View", |ui| {
-                let connected = matches!(self.conn, ConnectionState::Connected { .. });
                 if ui
-                    .add_enabled(connected, egui::Button::new("Dashboard"))
+                    .add_enabled(any_connected, egui::Button::new("Dashboard"))
                     .clicked()
                 {
                     actions.push(AppAction::OpenDashboard);
@@ -988,10 +1154,21 @@ impl SiftApp {
 
     fn status_bar(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let status = match &self.conn {
-                ConnectionState::Disconnected => "Disconnected".to_owned(),
-                ConnectionState::Connecting { name, .. } => format!("Connecting to {name}…"),
-                ConnectionState::Connected { name, .. } => format!("Connected to {name}"),
+            let connected: Vec<&str> = self
+                .connections
+                .iter()
+                .filter(|c| c.is_connected())
+                .map(|c| c.name.as_str())
+                .collect();
+            let connecting = self.connections.iter().any(|c| !c.is_connected());
+            let status = if connected.is_empty() {
+                if connecting {
+                    "Connecting…".to_owned()
+                } else {
+                    "Disconnected".to_owned()
+                }
+            } else {
+                format!("Connected: {}", connected.join(", "))
             };
             ui.label(status);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1021,7 +1198,7 @@ impl SiftApp {
         let Some(messages) = dialog.build() else {
             return Some(dialog); // validation error shown inline
         };
-        let ns = self.namespace_id()?; // not connected → close the dialog
+        let ns = dialog.ns;
         let target = dialog.target.clone();
         let req = self.backend.next_request();
         match schedule {
@@ -1058,9 +1235,9 @@ impl SiftApp {
     /// dashboard auto-refresh) at the top of each frame.
     fn tick(&mut self, ctx: &egui::Context, actions: &mut Vec<AppAction>) {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
-            self.tree.filter.focus_requested = true;
+            self.filter.focus_requested = true;
         }
-        if self.tree.filter.tick() {
+        if self.filter.tick() {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
         }
 
@@ -1119,20 +1296,20 @@ impl SiftApp {
 
         if let Some(mut dialog) = self.confirm.take() {
             match dialogs::show_confirm(ctx, &mut dialog) {
-                Some(ConfirmAction::Confirm) => {
-                    if let Some(ns) = self.namespace_id() {
-                        match dialog.action {
-                            PendingConfirm::Delete(path) => {
-                                let req = self.backend.next_request();
-                                self.backend.send(Command::DeleteEntity { req, ns, path });
-                            }
-                            PendingConfirm::Purge(source) => {
-                                let op = self.backend.next_op();
-                                self.backend.send(Command::StartPurge { op, ns, source });
-                            }
-                        }
+                Some(ConfirmAction::Confirm) => match dialog.action {
+                    PendingConfirm::Delete(scoped) => {
+                        let req = self.backend.next_request();
+                        self.backend.send(Command::DeleteEntity {
+                            req,
+                            ns: scoped.ns,
+                            path: scoped.path,
+                        });
                     }
-                }
+                    PendingConfirm::Purge { ns, source } => {
+                        let op = self.backend.next_op();
+                        self.backend.send(Command::StartPurge { op, ns, source });
+                    }
+                },
                 Some(ConfirmAction::Close) => {}
                 None => self.confirm = Some(dialog),
             }
@@ -1142,10 +1319,12 @@ impl SiftApp {
             match dialogs::show_create(ctx, &mut dialog) {
                 Some(CreateAction::Create) => match dialog.build() {
                     Some(desc) => {
-                        if let Some(ns) = self.namespace_id() {
-                            let req = self.backend.next_request();
-                            self.backend.send(Command::CreateEntity { req, ns, desc });
-                        }
+                        let req = self.backend.next_request();
+                        self.backend.send(Command::CreateEntity {
+                            req,
+                            ns: dialog.ns,
+                            desc,
+                        });
                     }
                     None => self.create_dialog = Some(dialog), // validation error shown inline
                 },
@@ -1174,23 +1353,26 @@ impl SiftApp {
     /// the window (the entity stays cached and can be reopened from the tree).
     fn show_popped_out(&mut self, ctx: &egui::Context, actions: &mut Vec<AppAction>) {
         let popped = std::mem::take(&mut self.popped_out);
-        let conn = &self.conn;
+        let connections = &self.connections;
         let entities = &mut self.open_entities;
         let peek_batch = self.config.ui.peek_batch;
         let mut still_open = Vec::with_capacity(popped.len());
 
-        for path in popped {
-            let viewport_id = egui::ViewportId::from_hash_of(("sift-entity-window", &path));
+        for scoped in popped {
+            let connected = connections
+                .iter()
+                .any(|c| c.profile_id == scoped.ns && c.is_connected());
+            let viewport_id = egui::ViewportId::from_hash_of(("sift-entity-window", &scoped));
             let builder = egui::ViewportBuilder::default()
-                .with_title(format!("sift — {}", path.name()))
+                .with_title(format!("sift — {}", scoped.path.name()))
                 .with_inner_size([900.0, 640.0]);
 
             let closed = ctx.show_viewport_immediate(viewport_id, builder, |ui, _class| {
-                tabs::render_entity(ui, conn, entities, peek_batch, &path, true, actions);
+                tabs::render_entity(ui, connected, entities, peek_batch, &scoped, true, actions);
                 ui.input(|i| i.viewport().close_requested())
             });
             if !closed {
-                still_open.push(path);
+                still_open.push(scoped);
             }
         }
         self.popped_out = still_open;
@@ -1260,13 +1442,12 @@ impl eframe::App for SiftApp {
             .default_size(280.0)
             .size_range(180.0..=600.0)
             .show(ui, |ui| {
-                tree_panel::show(ui, &self.conn, &mut self.tree, &mut actions);
+                tree_panel::show(ui, &self.connections, &mut self.filter, &mut actions);
             });
 
         // The dock fills the remaining central space.
         let mut viewer = TabViewerCtx {
-            conn: &self.conn,
-            tree: &self.tree,
+            connections: &self.connections,
             dashboard: &mut self.dashboard,
             entities: &mut self.open_entities,
             peek_batch: self.config.ui.peek_batch,

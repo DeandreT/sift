@@ -2,7 +2,7 @@
 //! body/properties viewer for the selected message.
 
 use egui_extras::{Column, TableBuilder};
-use sift_backend::{Disposition, MessageSource, ReceiveMode};
+use sift_backend::{Disposition, MessageSource, NamespaceId, ReceiveMode};
 use sift_core::body::{BodyFormat, hex_dump};
 use sift_core::message::{MessageState, SiftMessage};
 
@@ -11,11 +11,12 @@ use crate::state::{AppAction, MessagesView};
 
 pub fn show(
     ui: &mut egui::Ui,
+    ns: NamespaceId,
     source: &MessageSource,
     view: &mut MessagesView,
     actions: &mut Vec<AppAction>,
 ) {
-    toolbar(ui, source, view, actions);
+    toolbar(ui, ns, source, view, actions);
     if let Some(error) = &view.error {
         ui.colored_label(ui.visuals().error_fg_color, error);
     }
@@ -43,6 +44,7 @@ pub fn show(
 #[allow(clippy::too_many_lines)] // toolbar with settle actions reads best inline
 fn toolbar(
     ui: &mut egui::Ui,
+    ns: NamespaceId,
     source: &MessageSource,
     view: &mut MessagesView,
     actions: &mut Vec<AppAction>,
@@ -56,6 +58,7 @@ fn toolbar(
             .clicked()
         {
             actions.push(AppAction::PeekMessages {
+                ns,
                 source: source.clone(),
                 from_seq: None,
                 count: view.fetch_count,
@@ -69,6 +72,7 @@ fn toolbar(
                 .clicked()
         {
             actions.push(AppAction::PeekMessages {
+                ns,
                 source: source.clone(),
                 from_seq: view.next_seq(),
                 count: view.fetch_count,
@@ -83,6 +87,7 @@ fn toolbar(
         ui.menu_button(format!("{} Receive", icon(Icon::Download)), |ui| {
             if ui.button("Receive with lock (settle afterwards)").clicked() {
                 actions.push(AppAction::ReceiveMessages {
+                    ns,
                     source: source.clone(),
                     mode: ReceiveMode::PeekLock,
                     count: view.fetch_count,
@@ -93,6 +98,7 @@ fn toolbar(
                 .color(ui.visuals().error_fg_color);
             if ui.button(destructive).clicked() {
                 actions.push(AppAction::ReceiveMessages {
+                    ns,
                     source: source.clone(),
                     mode: ReceiveMode::ReceiveAndDelete,
                     count: view.fetch_count,
@@ -110,6 +116,7 @@ fn toolbar(
             let (token, seq) = (token.clone(), *seq);
             ui.separator();
             let settle = |disposition: Disposition| AppAction::Settle {
+                ns,
                 source: source.clone(),
                 lock_token: token.clone(),
                 disposition,
@@ -152,6 +159,7 @@ fn toolbar(
                 .clicked()
             {
                 actions.push(AppAction::CancelScheduled {
+                    ns,
                     target: send_target(source),
                     sequence_number: *seq,
                 });
@@ -172,6 +180,7 @@ fn toolbar(
                 .clicked()
             {
                 actions.push(AppAction::ReceiveDeferred {
+                    ns,
                     source: source.clone(),
                     sequence_numbers: view.deferred_seqs.clone(),
                 });
@@ -189,6 +198,7 @@ fn toolbar(
             {
                 let target = send_target(source);
                 actions.push(AppAction::OpenSendDialog {
+                    ns,
                     target,
                     prefill: Some(Box::new(message.to_outbound())),
                 });
@@ -206,7 +216,10 @@ fn toolbar(
                 .on_hover_text("Delete every message in this view")
                 .clicked()
             {
-                actions.push(AppAction::RequestPurge(source.clone()));
+                actions.push(AppAction::RequestPurge {
+                    ns,
+                    source: source.clone(),
+                });
             }
             if source.dead_letter
                 && ui
@@ -215,6 +228,7 @@ fn toolbar(
                     .clicked()
             {
                 actions.push(AppAction::ResubmitAll {
+                    ns,
                     source: source.clone(),
                     target: send_target(source),
                 });

@@ -1,47 +1,63 @@
 //! UI-side application state: plain data owned by the app, mutated only on
 //! the UI thread.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use sift_backend::{
-    Disposition, EntityInfo, EntityPath, MessageSource, OpId, OpKind, ReceiveMode, RequestId,
+    Disposition, EntityInfo, EntityPath, MessageSource, NamespaceId, OpId, OpKind, ReceiveMode,
+    RequestId,
 };
 use sift_core::message::{OutboundMessage, SiftMessage};
 use sift_mgmt::{NamespaceInfo, QueueInfo, RuleInfo, SubscriptionInfo, TopicInfo};
 use uuid::Uuid;
 
-/// Where we are with the (single, for now) namespace connection.
-#[derive(Debug, Clone, Default)]
-pub enum ConnectionState {
-    #[default]
-    Disconnected,
-    Connecting {
-        profile_id: Uuid,
-        name: String,
-    },
-    Connected {
-        profile_id: Uuid,
-        name: String,
-        info: NamespaceInfo,
-    },
+/// An entity qualified by the namespace connection it lives on, so multiple
+/// simultaneous connections can hold same-named entities apart.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct ScopedEntity {
+    pub ns: NamespaceId,
+    pub path: EntityPath,
 }
 
-impl ConnectionState {
+impl ScopedEntity {
     #[must_use]
-    pub fn namespace_id(&self) -> Option<Uuid> {
-        match self {
-            Self::Disconnected => None,
-            Self::Connecting { profile_id, .. } | Self::Connected { profile_id, .. } => {
-                Some(*profile_id)
-            }
-        }
+    pub fn new(ns: NamespaceId, path: EntityPath) -> Self {
+        Self { ns, path }
     }
 }
 
-/// An in-flight connect request, used to match the response event.
+/// One namespace connection held by the UI. `info` is `None` while the
+/// connection attempt is still in flight.
 #[derive(Debug)]
+pub struct Connection {
+    pub profile_id: Uuid,
+    pub name: String,
+    pub info: Option<NamespaceInfo>,
+    pub tree: EntityTree,
+}
+
+impl Connection {
+    #[must_use]
+    pub fn connecting(profile_id: Uuid, name: String) -> Self {
+        Self {
+            profile_id,
+            name,
+            info: None,
+            tree: EntityTree::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_connected(&self) -> bool {
+        self.info.is_some()
+    }
+}
+
+/// An in-flight connect attempt, tracked so a stale response can be ignored.
+#[derive(Debug, Clone)]
 pub struct PendingConnect {
     pub req: RequestId,
+    pub profile_id: Uuid,
     pub name: String,
 }
 
@@ -55,7 +71,7 @@ pub enum Loadable<T> {
     Failed(String),
 }
 
-/// The entity tree model for the connected namespace. Data-only; the tree
+/// The entity tree model for one connected namespace. Data-only; the tree
 /// panel renders whatever is here and emits load actions for missing pieces.
 #[derive(Debug, Default)]
 pub struct EntityTree {
@@ -65,11 +81,11 @@ pub struct EntityTree {
     pub subscriptions: HashMap<String, Loadable<Vec<SubscriptionInfo>>>,
     /// Keyed by (topic, subscription).
     pub rules: HashMap<(String, String), Loadable<Vec<RuleInfo>>>,
-    pub filter: TreeFilter,
 }
 
 /// Case-insensitive substring filter over the tree, with a short debounce so
-/// typing doesn't recompute every keystroke.
+/// typing doesn't recompute every keystroke. One filter applies across all
+/// connections.
 #[derive(Debug, Default)]
 pub struct TreeFilter {
     /// The text currently in the filter box.
@@ -165,12 +181,9 @@ mod tests {
 }
 
 impl EntityTree {
-    /// Forget loaded data (on disconnect or refresh-all), keeping the filter.
+    /// Forget loaded data (on disconnect or refresh-all).
     pub fn clear(&mut self) {
-        self.queues = Loadable::NotLoaded;
-        self.topics = Loadable::NotLoaded;
-        self.subscriptions.clear();
-        self.rules.clear();
+        *self = Self::default();
     }
 
     /// Drop the cached list that contains `path`, forcing a reload.
@@ -331,46 +344,67 @@ pub enum CreateKind {
 #[derive(Debug, Clone)]
 pub enum AppAction {
     OpenConnectDialog,
-    Disconnect,
+    Disconnect(NamespaceId),
     ImportLegacyProfiles,
-    LoadQueues,
-    LoadTopics,
-    LoadSubscriptions(String),
-    LoadRules(String, String),
-    RefreshTree,
-    OpenEntity(EntityPath),
-    RefreshEntity(EntityPath),
+    LoadQueues(NamespaceId),
+    LoadTopics(NamespaceId),
+    LoadSubscriptions {
+        ns: NamespaceId,
+        topic: String,
+    },
+    LoadRules {
+        ns: NamespaceId,
+        topic: String,
+        subscription: String,
+    },
+    RefreshTree(NamespaceId),
+    OpenEntity(ScopedEntity),
+    RefreshEntity(ScopedEntity),
     /// Apply a modified description (e.g. status change) to the service.
-    UpdateEntity(Box<EntityInfo>),
-    OpenCreateDialog(CreateKind),
-    RequestDelete(EntityPath),
+    UpdateEntity {
+        ns: NamespaceId,
+        info: Box<EntityInfo>,
+    },
+    OpenCreateDialog {
+        ns: NamespaceId,
+        kind: CreateKind,
+    },
+    RequestDelete(ScopedEntity),
     PeekMessages {
+        ns: NamespaceId,
         source: MessageSource,
         from_seq: Option<i64>,
         count: u32,
     },
     ReceiveMessages {
+        ns: NamespaceId,
         source: MessageSource,
         mode: ReceiveMode,
         count: u32,
     },
     Settle {
+        ns: NamespaceId,
         source: MessageSource,
         lock_token: String,
         disposition: Disposition,
     },
     OpenSendDialog {
+        ns: NamespaceId,
         target: EntityPath,
         prefill: Option<Box<OutboundMessage>>,
     },
     /// Detach an entity from the dock into its own OS window.
-    PopOutEntity(EntityPath),
+    PopOutEntity(ScopedEntity),
     /// Return a popped-out entity to the dock.
-    DockEntity(EntityPath),
+    DockEntity(ScopedEntity),
     /// Ask for confirmation before draining a source.
-    RequestPurge(MessageSource),
+    RequestPurge {
+        ns: NamespaceId,
+        source: MessageSource,
+    },
     /// Move every dead-letter message back onto its parent entity.
     ResubmitAll {
+        ns: NamespaceId,
         source: MessageSource,
         target: EntityPath,
     },
@@ -380,20 +414,24 @@ pub enum AppAction {
     SetDashboardAutoRefresh(AutoRefresh),
     /// Cancel a scheduled message by sequence number.
     CancelScheduled {
+        ns: NamespaceId,
         target: EntityPath,
         sequence_number: i64,
     },
     /// Retrieve deferred messages (by tracked sequence numbers) into a view.
     ReceiveDeferred {
+        ns: NamespaceId,
         source: MessageSource,
         sequence_numbers: Vec<i64>,
     },
-    ExportNamespace,
+    ExportNamespace(NamespaceId),
     ImportNamespace {
+        ns: NamespaceId,
         overwrite: bool,
     },
     /// Accept and browse a session (read-only).
     BrowseSession {
+        ns: NamespaceId,
         source: MessageSource,
         session_id: Option<String>,
         count: u32,
@@ -404,6 +442,7 @@ pub enum AppAction {
 #[derive(Debug, Clone)]
 pub struct RunningOp {
     pub op: OpId,
+    pub ns: NamespaceId,
     pub kind: OpKind,
     pub done: u64,
     pub target: String,
@@ -449,6 +488,7 @@ impl AutoRefresh {
 pub struct DashboardState {
     pub auto_refresh: AutoRefresh,
     pub next_refresh: Option<std::time::Instant>,
-    /// Set by a refresh so subscriptions are reloaded once topics arrive.
-    pub wants_subscriptions: bool,
+    /// Namespaces whose subscriptions should be fanned out once their topic
+    /// list arrives (set by a dashboard refresh).
+    pub wants_subscriptions: HashSet<Uuid>,
 }

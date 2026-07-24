@@ -4,18 +4,18 @@
 
 use std::time::Duration;
 
-use sift_backend::{EntityInfo, EntityPath};
+use sift_backend::{EntityInfo, EntityPath, NamespaceId};
 use sift_mgmt::{
     EntityRuntimeInfo, EntityStatus, MessageCountDetails, QueueInfo, RuleFilter, RuleInfo,
     SubscriptionInfo, TopicInfo, is_unlimited,
 };
 
 use crate::icons::{Icon, icon};
-use crate::state::AppAction;
+use crate::state::{AppAction, ScopedEntity};
 
-pub fn show(ui: &mut egui::Ui, info: &EntityInfo, actions: &mut Vec<AppAction>) {
+pub fn show(ui: &mut egui::Ui, ns: NamespaceId, info: &EntityInfo, actions: &mut Vec<AppAction>) {
     let path = info.path();
-    header(ui, &path, info, actions);
+    header(ui, ns, &path, info, actions);
     ui.separator();
 
     egui::ScrollArea::vertical()
@@ -185,35 +185,53 @@ fn rule_view(ui: &mut egui::Ui, r: &RuleInfo) {
     }
 }
 
-fn header(ui: &mut egui::Ui, path: &EntityPath, info: &EntityInfo, actions: &mut Vec<AppAction>) {
+fn header(
+    ui: &mut egui::Ui,
+    ns: NamespaceId,
+    path: &EntityPath,
+    info: &EntityInfo,
+    actions: &mut Vec<AppAction>,
+) {
     ui.horizontal(|ui| {
         ui.heading(path.name());
         ui.label(egui::RichText::new(path.kind()).weak());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.button("Delete…").clicked() {
-                actions.push(AppAction::RequestDelete(path.clone()));
+                actions.push(AppAction::RequestDelete(ScopedEntity::new(
+                    ns,
+                    path.clone(),
+                )));
             }
             if ui
                 .button(format!("{} Refresh", icon(Icon::RefreshCw)))
                 .clicked()
             {
-                actions.push(AppAction::RefreshEntity(path.clone()));
+                actions.push(AppAction::RefreshEntity(ScopedEntity::new(
+                    ns,
+                    path.clone(),
+                )));
             }
             if matches!(path, EntityPath::Queue(_) | EntityPath::Topic(_))
                 && ui.button(format!("{} Send…", icon(Icon::Send))).clicked()
             {
                 actions.push(AppAction::OpenSendDialog {
+                    ns,
                     target: path.clone(),
                     prefill: None,
                 });
             }
-            status_selector(ui, info, actions);
+            status_selector(ui, ns, info, actions);
         });
     });
 }
 
 /// Status dropdown that immediately applies a change to the service.
-fn status_selector(ui: &mut egui::Ui, info: &EntityInfo, actions: &mut Vec<AppAction>) {
+fn status_selector(
+    ui: &mut egui::Ui,
+    ns: NamespaceId,
+    info: &EntityInfo,
+    actions: &mut Vec<AppAction>,
+) {
     let current = match info {
         EntityInfo::Queue(q) => q.properties.status,
         EntityInfo::Topic(t) => t.properties.status,
@@ -236,7 +254,10 @@ fn status_selector(ui: &mut egui::Ui, info: &EntityInfo, actions: &mut Vec<AppAc
             EntityInfo::Subscription(s) => s.properties.status = selected,
             EntityInfo::Rule(_) => unreachable!(),
         }
-        actions.push(AppAction::UpdateEntity(Box::new(updated)));
+        actions.push(AppAction::UpdateEntity {
+            ns,
+            info: Box::new(updated),
+        });
     }
 }
 

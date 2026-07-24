@@ -17,15 +17,18 @@ pub struct ConnectDialog {
     /// Pasted connection string; empty means "use the stored secret".
     pub connection_string: String,
     pub show_secret: bool,
+    /// Connect this profile automatically when the app starts.
+    pub auto_connect: bool,
     pub error: Option<String>,
 }
 
 impl ConnectDialog {
     #[must_use]
-    pub fn for_profile(id: Uuid, name: String) -> Self {
+    pub fn for_profile(id: Uuid, name: String, auto_connect: bool) -> Self {
         Self {
             selected: Some(id),
             name,
+            auto_connect,
             ..Self::default()
         }
     }
@@ -72,7 +75,11 @@ pub fn show(
                         .selectable_label(dialog.selected == Some(profile.id), &profile.name)
                         .clicked()
                     {
-                        *dialog = ConnectDialog::for_profile(profile.id, profile.name.clone());
+                        *dialog = ConnectDialog::for_profile(
+                            profile.id,
+                            profile.name.clone(),
+                            profile.auto_connect,
+                        );
                     }
                 }
             });
@@ -115,6 +122,10 @@ pub fn show(
                 });
                 ui.end_row();
             });
+
+        ui.add_space(6.0);
+        ui.checkbox(&mut dialog.auto_connect, "Connect automatically on startup")
+            .on_hover_text("Open this namespace when sift launches");
 
         if let Some(error) = &dialog.error {
             ui.add_space(4.0);

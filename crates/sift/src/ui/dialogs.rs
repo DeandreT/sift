@@ -1,20 +1,23 @@
 //! Modal dialogs: a typed-name confirmation guard (shared by delete and
 //! purge) and entity creation forms.
 
-use sift_backend::{EntityDescription, EntityPath, MessageSource};
+use sift_backend::{EntityDescription, MessageSource, NamespaceId};
 use sift_mgmt::{
     QueueProperties, RuleFilter, RuleProperties, SubscriptionProperties, TopicProperties,
 };
 
-use crate::state::CreateKind;
+use crate::state::{CreateKind, ScopedEntity};
 
 // ---- destructive-action confirmation ----------------------------------------
 
 /// What a confirmed dialog will do. Carries the payload the app needs.
 #[derive(Debug, Clone)]
 pub enum PendingConfirm {
-    Delete(EntityPath),
-    Purge(MessageSource),
+    Delete(ScopedEntity),
+    Purge {
+        ns: NamespaceId,
+        source: MessageSource,
+    },
 }
 
 #[derive(Debug)]
@@ -31,8 +34,8 @@ impl ConfirmDialog {
     #[must_use]
     pub fn new(action: PendingConfirm, require_typed_name: bool) -> Self {
         let name = match &action {
-            PendingConfirm::Delete(path) => path.name().to_owned(),
-            PendingConfirm::Purge(source) => source.entity.name().to_owned(),
+            PendingConfirm::Delete(scoped) => scoped.path.name().to_owned(),
+            PendingConfirm::Purge { source, .. } => source.entity.name().to_owned(),
         };
         Self {
             action,
@@ -44,20 +47,23 @@ impl ConfirmDialog {
 
     fn heading(&self) -> String {
         match &self.action {
-            PendingConfirm::Delete(path) => format!("Delete {}", path.kind()),
-            PendingConfirm::Purge(source) if source.dead_letter => {
+            PendingConfirm::Delete(scoped) => format!("Delete {}", scoped.path.kind()),
+            PendingConfirm::Purge { source, .. } if source.dead_letter => {
                 "Purge dead-letter queue".to_owned()
             }
-            PendingConfirm::Purge(_) => "Purge messages".to_owned(),
+            PendingConfirm::Purge { .. } => "Purge messages".to_owned(),
         }
     }
 
     fn body(&self) -> String {
         match &self.action {
-            PendingConfirm::Delete(path) => {
-                format!("This permanently deletes '{path}' and everything in it.")
+            PendingConfirm::Delete(scoped) => {
+                format!(
+                    "This permanently deletes '{}' and everything in it.",
+                    scoped.path
+                )
             }
-            PendingConfirm::Purge(source) => {
+            PendingConfirm::Purge { source, .. } => {
                 format!("This permanently deletes every message in '{source}'.")
             }
         }
@@ -66,7 +72,7 @@ impl ConfirmDialog {
     fn confirm_label(&self) -> &'static str {
         match &self.action {
             PendingConfirm::Delete(_) => "Delete",
-            PendingConfirm::Purge(_) => "Purge",
+            PendingConfirm::Purge { .. } => "Purge",
         }
     }
 }
@@ -127,6 +133,8 @@ pub fn show_confirm(ctx: &egui::Context, dialog: &mut ConfirmDialog) -> Option<C
 /// on submit.
 #[derive(Debug)]
 pub struct CreateDialog {
+    /// Namespace the new entity will be created on.
+    pub ns: NamespaceId,
     pub kind: CreateKind,
     pub name: String,
     pub requires_session: bool,
@@ -144,8 +152,9 @@ pub struct CreateDialog {
 
 impl CreateDialog {
     #[must_use]
-    pub fn new(kind: CreateKind) -> Self {
+    pub fn new(ns: NamespaceId, kind: CreateKind) -> Self {
         Self {
+            ns,
             kind,
             name: String::new(),
             requires_session: false,

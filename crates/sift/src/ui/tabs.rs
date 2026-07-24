@@ -1,5 +1,5 @@
 //! The dockable tab system. Tabs are identified by [`TabId`]; entity tab data
-//! lives in the app's `open_entities` map, keyed by entity path.
+//! lives in the app's `open_entities` map, keyed by [`ScopedEntity`].
 
 use std::collections::HashMap;
 
@@ -7,7 +7,7 @@ use sift_backend::{EntityPath, MessageSource};
 
 use crate::icons::{Icon, icon};
 use crate::state::{
-    AppAction, ConnectionState, DashboardState, EntityPage, EntityTabState, EntityTree, Loadable,
+    AppAction, Connection, DashboardState, EntityPage, EntityTabState, Loadable, ScopedEntity,
 };
 use crate::ui::{dashboard, entity_view, messages_view, sessions_view};
 
@@ -15,15 +15,14 @@ use crate::ui::{dashboard, entity_view, messages_view, sessions_view};
 pub enum TabId {
     Welcome,
     Dashboard,
-    Entity(EntityPath),
+    Entity(ScopedEntity),
 }
 
 /// Borrowed view of app state handed to the dock each frame.
 pub struct TabViewerCtx<'a> {
-    pub conn: &'a ConnectionState,
-    pub tree: &'a EntityTree,
+    pub connections: &'a [Connection],
     pub dashboard: &'a mut DashboardState,
-    pub entities: &'a mut HashMap<EntityPath, EntityTabState>,
+    pub entities: &'a mut HashMap<ScopedEntity, EntityTabState>,
     pub peek_batch: u32,
     pub actions: &'a mut Vec<AppAction>,
 }
@@ -35,7 +34,17 @@ impl egui_dock::TabViewer for TabViewerCtx<'_> {
         match tab {
             TabId::Welcome => "Welcome".into(),
             TabId::Dashboard => "Dashboard".into(),
-            TabId::Entity(path) => path.name().into(),
+            // Disambiguate same-named entities across connections when more
+            // than one is open.
+            TabId::Entity(scoped) => {
+                if self.connections.len() > 1
+                    && let Some(conn) = self.connections.iter().find(|c| c.profile_id == scoped.ns)
+                {
+                    format!("{} · {}", scoped.path.name(), conn.name).into()
+                } else {
+                    scoped.path.name().into()
+                }
+            }
         }
     }
 
@@ -43,17 +52,23 @@ impl egui_dock::TabViewer for TabViewerCtx<'_> {
         match tab {
             TabId::Welcome => self.welcome(ui),
             TabId::Dashboard => {
-                dashboard::show(ui, self.tree, self.dashboard, self.actions);
+                dashboard::show(ui, self.connections, self.dashboard, self.actions);
             }
-            TabId::Entity(path) => render_entity(
-                ui,
-                self.conn,
-                self.entities,
-                self.peek_batch,
-                path,
-                false,
-                self.actions,
-            ),
+            TabId::Entity(scoped) => {
+                let connected = self
+                    .connections
+                    .iter()
+                    .any(|c| c.profile_id == scoped.ns && c.is_connected());
+                render_entity(
+                    ui,
+                    connected,
+                    self.entities,
+                    self.peek_batch,
+                    scoped,
+                    false,
+                    self.actions,
+                );
+            }
         }
     }
 
@@ -69,28 +84,20 @@ impl TabViewerCtx<'_> {
             ui.heading("sift");
             ui.label(egui::RichText::new("Azure Service Bus explorer").weak());
             ui.add_space(16.0);
-            match self.conn {
-                ConnectionState::Disconnected => {
-                    let label = format!("{} Connect to a namespace…", icon(Icon::Plug));
-                    if ui.button(label).clicked() {
-                        self.actions.push(AppAction::OpenConnectDialog);
-                    }
+            if self.connections.is_empty() {
+                let label = format!("{} Connect to a namespace…", icon(Icon::Plug));
+                if ui.button(label).clicked() {
+                    self.actions.push(AppAction::OpenConnectDialog);
                 }
-                ConnectionState::Connecting { name, .. } => {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(format!("Connecting to {name}…"));
-                    });
-                }
-                ConnectionState::Connected { info, .. } => {
-                    ui.label(format!("Connected to {}.", info.name));
-                    ui.label(
-                        egui::RichText::new(
-                            "Browse entities in the tree on the left; click one to open it here.",
-                        )
-                        .weak(),
-                    );
-                }
+            } else {
+                let names: Vec<&str> = self.connections.iter().map(|c| c.name.as_str()).collect();
+                ui.label(format!("Connected to {}.", names.join(", ")));
+                ui.label(
+                    egui::RichText::new(
+                        "Browse entities in the tree on the left; click one to open it here.",
+                    )
+                    .weak(),
+                );
             }
         });
     }
@@ -101,35 +108,37 @@ impl TabViewerCtx<'_> {
 /// toolbar offers "Pop out" (dock → window) or "Dock" (window → dock).
 pub fn render_entity(
     ui: &mut egui::Ui,
-    conn: &ConnectionState,
-    entities: &mut HashMap<EntityPath, EntityTabState>,
+    connected: bool,
+    entities: &mut HashMap<ScopedEntity, EntityTabState>,
     peek_batch: u32,
-    path: &EntityPath,
+    scoped: &ScopedEntity,
     popped: bool,
     actions: &mut Vec<AppAction>,
 ) {
-    if !matches!(conn, ConnectionState::Connected { .. }) {
+    if !connected {
         ui.add_space(16.0);
         ui.label(egui::RichText::new("Not connected.").weak());
         return;
     }
     // Salt the ID space per entity so two tabs visible at once (dock splits,
     // pop-outs) don't clash on fixed widget IDs inside the viewers.
-    ui.push_id(path, |ui| {
-        render_entity_inner(ui, entities, peek_batch, path, popped, actions);
+    ui.push_id(scoped, |ui| {
+        render_entity_inner(ui, entities, peek_batch, scoped, popped, actions);
     });
 }
 
 fn render_entity_inner(
     ui: &mut egui::Ui,
-    entities: &mut HashMap<EntityPath, EntityTabState>,
+    entities: &mut HashMap<ScopedEntity, EntityTabState>,
     peek_batch: u32,
-    path: &EntityPath,
+    scoped: &ScopedEntity,
     popped: bool,
     actions: &mut Vec<AppAction>,
 ) {
+    let ns = scoped.ns;
+    let path = &scoped.path;
     let state = entities
-        .entry(path.clone())
+        .entry(scoped.clone())
         .or_insert_with(|| EntityTabState::new(peek_batch));
 
     // Top row: page selector (message-capable entities) plus a pop-out /
@@ -171,71 +180,71 @@ fn render_entity_inner(
                     .on_hover_text("Return this window to the main frame")
                     .clicked()
                 {
-                    actions.push(AppAction::DockEntity(path.clone()));
+                    actions.push(AppAction::DockEntity(scoped.clone()));
                 }
             } else if ui
                 .button(format!("{} Pop out", icon(Icon::ExternalLink)))
                 .on_hover_text("Detach into a separate window")
                 .clicked()
             {
-                actions.push(AppAction::PopOutEntity(path.clone()));
+                actions.push(AppAction::PopOutEntity(scoped.clone()));
             }
         });
     });
     ui.separator();
 
     match state.page {
-        EntityPage::Overview => overview(ui, path, state, actions),
+        EntityPage::Overview => overview(ui, scoped, state, actions),
         EntityPage::Messages => {
             let source = MessageSource {
                 entity: path.clone(),
                 dead_letter: false,
             };
-            messages_view::show(ui, &source, &mut state.main, actions);
+            messages_view::show(ui, ns, &source, &mut state.main, actions);
         }
         EntityPage::DeadLetter => {
             let source = MessageSource {
                 entity: path.clone(),
                 dead_letter: true,
             };
-            messages_view::show(ui, &source, &mut state.dead_letter, actions);
+            messages_view::show(ui, ns, &source, &mut state.dead_letter, actions);
         }
         EntityPage::Sessions => {
             let source = MessageSource {
                 entity: path.clone(),
                 dead_letter: false,
             };
-            sessions_view::show(ui, &source, &mut state.sessions, actions);
+            sessions_view::show(ui, ns, &source, &mut state.sessions, actions);
         }
     }
 }
 
 fn overview(
     ui: &mut egui::Ui,
-    path: &EntityPath,
+    scoped: &ScopedEntity,
     state: &EntityTabState,
     actions: &mut Vec<AppAction>,
 ) {
     match &state.info {
         Loadable::NotLoaded => {
-            actions.push(AppAction::RefreshEntity(path.clone()));
+            actions.push(AppAction::RefreshEntity(scoped.clone()));
         }
         Loadable::Loading => {
             ui.add_space(24.0);
             ui.vertical_centered(|ui| {
                 ui.spinner();
-                ui.label(format!("Loading {}…", path.name()));
+                ui.label(format!("Loading {}…", scoped.path.name()));
             });
         }
         Loadable::Failed(error) => {
             ui.add_space(16.0);
             ui.colored_label(ui.visuals().error_fg_color, error);
             if ui.button("Retry").clicked() {
-                actions.push(AppAction::RefreshEntity(path.clone()));
+                actions.push(AppAction::RefreshEntity(scoped.clone()));
             }
         }
         Loadable::Loaded(info) => {
-            entity_view::show(ui, info, actions);
+            entity_view::show(ui, scoped.ns, info, actions);
         }
     }
 }

@@ -1,12 +1,14 @@
 //! Compose-and-send dialog, also used prefilled for resend/resubmit.
 
-use sift_backend::EntityPath;
+use sift_backend::{EntityPath, NamespaceId};
 use sift_core::message::OutboundMessage;
 
 use crate::icons::{Icon, icon};
 
 #[derive(Debug)]
 pub struct SendDialog {
+    /// Namespace the message will be sent to.
+    pub ns: NamespaceId,
     pub target: EntityPath,
     pub body: String,
     /// Original bytes when resending a non-text body verbatim.
@@ -27,8 +29,9 @@ pub struct SendDialog {
 
 impl SendDialog {
     #[must_use]
-    pub fn new(target: EntityPath) -> Self {
+    pub fn new(ns: NamespaceId, target: EntityPath) -> Self {
         Self {
+            ns,
             target,
             body: String::new(),
             raw_bytes: None,
@@ -60,7 +63,7 @@ impl SendDialog {
     }
 
     #[must_use]
-    pub fn prefilled(target: EntityPath, from: OutboundMessage) -> Self {
+    pub fn prefilled(ns: NamespaceId, target: EntityPath, from: OutboundMessage) -> Self {
         Self {
             body: from.body,
             raw_bytes: from.raw_bytes,
@@ -73,7 +76,7 @@ impl SendDialog {
                 .map(|d| d.as_secs().to_string())
                 .unwrap_or_default(),
             properties: from.application_properties,
-            ..Self::new(target)
+            ..Self::new(ns, target)
         }
     }
 

@@ -382,36 +382,43 @@ pub enum Event {
     },
     Queues {
         req: RequestId,
+        ns: NamespaceId,
         result: Result<Vec<QueueInfo>, BackendError>,
     },
     Topics {
         req: RequestId,
+        ns: NamespaceId,
         result: Result<Vec<TopicInfo>, BackendError>,
     },
     Subscriptions {
         req: RequestId,
+        ns: NamespaceId,
         topic: String,
         result: Result<Vec<SubscriptionInfo>, BackendError>,
     },
     Rules {
         req: RequestId,
+        ns: NamespaceId,
         topic: String,
         subscription: String,
         result: Result<Vec<RuleInfo>, BackendError>,
     },
     Entity {
         req: RequestId,
+        ns: NamespaceId,
         path: EntityPath,
         result: Result<EntityInfo, BackendError>,
     },
     Mutated {
         req: RequestId,
+        ns: NamespaceId,
         op: MutationOp,
         path: EntityPath,
         result: Result<Option<EntityInfo>, BackendError>,
     },
     Messages {
         req: RequestId,
+        ns: NamespaceId,
         source: MessageSource,
         /// The `from_seq` of the request; `Some` means "append to the view".
         from_seq: Option<i64>,
@@ -422,6 +429,7 @@ pub enum Event {
     },
     Settled {
         req: RequestId,
+        ns: NamespaceId,
         source: MessageSource,
         lock_token: String,
         disposition: Disposition,
@@ -429,6 +437,7 @@ pub enum Event {
     },
     Sent {
         req: RequestId,
+        ns: NamespaceId,
         target: EntityPath,
         count: usize,
         /// Sequence numbers when this was a schedule; empty for a plain send.
@@ -436,6 +445,7 @@ pub enum Event {
     },
     ScheduledCancelled {
         req: RequestId,
+        ns: NamespaceId,
         target: EntityPath,
         sequence_number: i64,
         result: Result<(), BackendError>,
@@ -443,10 +453,12 @@ pub enum Event {
     /// One-line summary of an import/export, e.g. "exported 12 entities".
     NamespaceTransfer {
         req: RequestId,
+        ns: NamespaceId,
         result: Result<String, BackendError>,
     },
     OpProgress {
         op: OpId,
+        ns: NamespaceId,
         kind: OpKind,
         /// Items processed so far.
         done: u64,
@@ -455,11 +467,13 @@ pub enum Event {
     },
     OpFinished {
         op: OpId,
+        ns: NamespaceId,
         result: Result<OpSummary, BackendError>,
         cancelled: bool,
     },
     Session {
         req: RequestId,
+        ns: NamespaceId,
         source: MessageSource,
         result: Result<SessionSnapshot, BackendError>,
     },

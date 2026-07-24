@@ -62,6 +62,9 @@ pub struct NamespaceProfile {
     pub endpoint: Option<Url>,
     #[serde(default)]
     pub transport: TransportType,
+    /// Connect to this namespace automatically when the app starts.
+    #[serde(default)]
+    pub auto_connect: bool,
     pub auth: AuthMethod,
 }
 
@@ -73,6 +76,7 @@ impl NamespaceProfile {
             name,
             endpoint: None,
             transport: TransportType::default(),
+            auto_connect: false,
             auth: AuthMethod::ConnectionString,
         }
     }

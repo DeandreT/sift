@@ -123,19 +123,24 @@ async fn run(mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Command>, sink: Ev
             Command::ListQueues { req, ns } => {
                 spawn_op(&sink, &state, ns, move |client, sink| async move {
                     let result = client.list_queues().await.map_err(Into::into);
-                    sink.send(Event::Queues { req, result });
+                    sink.send(Event::Queues { req, ns, result });
                 });
             }
             Command::ListTopics { req, ns } => {
                 spawn_op(&sink, &state, ns, move |client, sink| async move {
                     let result = client.list_topics().await.map_err(Into::into);
-                    sink.send(Event::Topics { req, result });
+                    sink.send(Event::Topics { req, ns, result });
                 });
             }
             Command::ListSubscriptions { req, ns, topic } => {
                 spawn_op(&sink, &state, ns, move |client, sink| async move {
                     let result = client.list_subscriptions(&topic).await.map_err(Into::into);
-                    sink.send(Event::Subscriptions { req, topic, result });
+                    sink.send(Event::Subscriptions {
+                        req,
+                        ns,
+                        topic,
+                        result,
+                    });
                 });
             }
             Command::ListRules {
@@ -151,6 +156,7 @@ async fn run(mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Command>, sink: Ev
                         .map_err(Into::into);
                     sink.send(Event::Rules {
                         req,
+                        ns,
                         topic,
                         subscription,
                         result,
@@ -160,7 +166,12 @@ async fn run(mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Command>, sink: Ev
             Command::GetEntity { req, ns, path } => {
                 spawn_op(&sink, &state, ns, move |client, sink| async move {
                     let result = get_entity(&client, &path).await;
-                    sink.send(Event::Entity { req, path, result });
+                    sink.send(Event::Entity {
+                        req,
+                        ns,
+                        path,
+                        result,
+                    });
                 });
             }
             Command::CreateEntity { req, ns, desc } => {
@@ -175,6 +186,7 @@ async fn run(mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Command>, sink: Ev
                     log_mutation(MutationOp::Deleted, &path, &result);
                     sink.send(Event::Mutated {
                         req,
+                        ns,
                         op: MutationOp::Deleted,
                         path,
                         result,
@@ -199,6 +211,7 @@ async fn run(mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Command>, sink: Ev
                     }
                     sink.send(Event::Messages {
                         req,
+                        ns,
                         source,
                         from_seq,
                         received: false,
@@ -232,6 +245,7 @@ async fn run(mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Command>, sink: Ev
                     }
                     sink.send(Event::Messages {
                         req,
+                        ns,
                         source,
                         from_seq: None,
                         received: true,
@@ -263,6 +277,7 @@ async fn run(mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Command>, sink: Ev
                     }
                     sink.send(Event::Settled {
                         req,
+                        ns,
                         source,
                         lock_token,
                         disposition,
@@ -294,6 +309,7 @@ async fn run(mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Command>, sink: Ev
                     }
                     sink.send(Event::Sent {
                         req,
+                        ns,
                         target,
                         count,
                         result,
@@ -327,6 +343,7 @@ async fn run(mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Command>, sink: Ev
                     }
                     sink.send(Event::Sent {
                         req,
+                        ns,
                         target,
                         count,
                         result,
@@ -355,6 +372,7 @@ async fn run(mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Command>, sink: Ev
                     }
                     sink.send(Event::ScheduledCancelled {
                         req,
+                        ns,
                         target,
                         sequence_number,
                         result,
@@ -383,6 +401,7 @@ async fn run(mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Command>, sink: Ev
                     }
                     sink.send(Event::Messages {
                         req,
+                        ns,
                         source,
                         from_seq: None,
                         received: true,
@@ -418,6 +437,7 @@ async fn run(mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Command>, sink: Ev
                     }
                     sink.send(Event::Session {
                         req,
+                        ns,
                         source,
                         result,
                     });
@@ -426,7 +446,7 @@ async fn run(mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Command>, sink: Ev
             Command::ExportNamespace { req, ns, path } => {
                 spawn_op(&sink, &state, ns, move |client, sink| async move {
                     let result = export_namespace(&client, &path).await;
-                    sink.send(Event::NamespaceTransfer { req, result });
+                    sink.send(Event::NamespaceTransfer { req, ns, result });
                 });
             }
             Command::ImportNamespace {
@@ -437,7 +457,7 @@ async fn run(mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Command>, sink: Ev
             } => {
                 spawn_op(&sink, &state, ns, move |client, sink| async move {
                     let result = import_namespace(&client, &path, overwrite).await;
-                    sink.send(Event::NamespaceTransfer { req, result });
+                    sink.send(Event::NamespaceTransfer { req, ns, result });
                 });
             }
             Command::StartPurge { op, ns, source } => {
@@ -492,6 +512,7 @@ fn start_op(
             let Some(nss) = guard.namespaces.get(&ns) else {
                 sink.send(Event::OpFinished {
                     op,
+                    ns,
                     result: Err(BackendError::new("not connected to this namespace")),
                     cancelled: false,
                 });
@@ -503,7 +524,7 @@ fn start_op(
         };
 
         let target_label = source.to_string();
-        let result = run_op(&conn, op, kind, &source, target.as_ref(), &token, &sink).await;
+        let result = run_op(&conn, op, ns, kind, &source, target.as_ref(), &token, &sink).await;
         let cancelled = token.is_cancelled();
         state.lock().await.ops.remove(&op);
 
@@ -518,15 +539,18 @@ fn start_op(
         }
         sink.send(Event::OpFinished {
             op,
+            ns,
             result,
             cancelled,
         });
     });
 }
 
+#[allow(clippy::too_many_arguments)] // internal orchestration helper
 async fn run_op(
     conn: &NamespaceConnection,
     op: OpId,
+    ns: NamespaceId,
     kind: OpKind,
     source: &MessageSource,
     target: Option<&EntityPath>,
@@ -573,6 +597,7 @@ async fn run_op(
 
         sink.send(Event::OpProgress {
             op,
+            ns,
             kind,
             done: processed,
             target: target_label.clone(),
@@ -652,6 +677,7 @@ fn mutate(
         log_mutation(op, &path, &result);
         sink.send(Event::Mutated {
             req,
+            ns,
             op,
             path,
             result,

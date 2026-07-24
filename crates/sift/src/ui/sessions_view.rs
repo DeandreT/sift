@@ -2,7 +2,7 @@
 //! its state, then release it. Settling within a held session is a future
 //! enhancement.
 
-use sift_backend::MessageSource;
+use sift_backend::{MessageSource, NamespaceId};
 
 use crate::icons::{Icon, icon};
 use crate::state::{AppAction, SessionsView};
@@ -10,6 +10,7 @@ use crate::state::{AppAction, SessionsView};
 #[allow(clippy::too_many_lines)] // toolbar + state view + message list read best together
 pub fn show(
     ui: &mut egui::Ui,
+    ns: NamespaceId,
     source: &MessageSource,
     view: &mut SessionsView,
     actions: &mut Vec<AppAction>,
@@ -23,6 +24,7 @@ pub fn show(
             .clicked()
         {
             actions.push(AppAction::BrowseSession {
+                ns,
                 source: source.clone(),
                 session_id: None,
                 count: view.fetch_count,
@@ -38,6 +40,7 @@ pub fn show(
         let named = view.session_id_input.trim().to_owned();
         if !view.loading && !named.is_empty() && ui.button("Accept this session").clicked() {
             actions.push(AppAction::BrowseSession {
+                ns,
                 source: source.clone(),
                 session_id: Some(named),
                 count: view.fetch_count,
