@@ -2,9 +2,9 @@
 resolver = "3"
 members = [
     "crates/sift",
-    "crates/sift-backend",
-    "crates/sift-core",
-    "crates/sift-mgmt",
+    "crates/backend",
+    "crates/core",
+    "crates/mgmt",
 ]
 
 [workspace.package]
@@ -14,9 +14,11 @@ rust-version = "1.97"
 license = "MIT"
 
 [workspace.dependencies]
-sift-backend = { path = "crates/sift-backend" }
-sift-core = { path = "crates/sift-core" }
-sift-mgmt = { path = "crates/sift-mgmt" }
+# Package names keep the `sift-` prefix (crate names can't collide with the
+# built-in `core`); only the folders drop it.
+sift-backend = { path = "crates/backend" }
+sift-core = { path = "crates/core" }
+sift-mgmt = { path = "crates/mgmt" }
 
 # GUI — egui-family crates move in lockstep; upgrade them together in one change.
 eframe = "0.35"
