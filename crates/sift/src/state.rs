@@ -229,4 +229,8 @@ pub enum AppAction {
         target: EntityPath,
         prefill: Option<Box<OutboundMessage>>,
     },
+    /// Detach an entity from the dock into its own OS window.
+    PopOutEntity(EntityPath),
+    /// Return a popped-out entity to the dock.
+    DockEntity(EntityPath),
 }

@@ -22,7 +22,7 @@ use crate::state::{
 use crate::ui::connect_dialog::{ConnectDialog, DialogAction};
 use crate::ui::dialogs::{ConfirmDeleteAction, ConfirmDeleteDialog, CreateAction, CreateDialog};
 use crate::ui::send_dialog::{SendAction, SendDialog};
-use crate::ui::tabs::{TabId, TabViewerCtx};
+use crate::ui::tabs::{self, TabId, TabViewerCtx};
 use crate::ui::{connect_dialog, dialogs, log_panel, send_dialog, tree_panel};
 
 pub struct SiftApp {
@@ -34,6 +34,8 @@ pub struct SiftApp {
     pending_connect: Option<PendingConnect>,
     tree: EntityTree,
     open_entities: HashMap<EntityPath, EntityTabState>,
+    /// Entities detached into their own OS windows (rendered as viewports).
+    popped_out: Vec<EntityPath>,
     dock: DockState<TabId>,
     log: LogBuffer,
     log_visible: bool,
@@ -76,6 +78,7 @@ impl SiftApp {
             pending_connect: None,
             tree: EntityTree::default(),
             open_entities: HashMap::new(),
+            popped_out: Vec::new(),
             dock: DockState::new(vec![TabId::Welcome]),
             log,
             log_visible: true,
@@ -120,6 +123,7 @@ impl SiftApp {
                         };
                         self.tree.clear();
                         self.open_entities.clear();
+                        self.popped_out.clear();
                     }
                     Err(e) => {
                         if let Some(detail) = &e.detail {
@@ -135,6 +139,7 @@ impl SiftApp {
                     self.conn = ConnectionState::Disconnected;
                     self.tree.clear();
                     self.open_entities.clear();
+                    self.popped_out.clear();
                     self.close_entity_tabs();
                 }
             }
@@ -389,7 +394,10 @@ impl SiftApp {
                 }
             }
             AppAction::RefreshTree => self.tree.clear(),
-            AppAction::OpenEntity(path) => self.open_entity_tab(&path),
+            // Docking a popped-out entity is the same as opening it.
+            AppAction::OpenEntity(path) | AppAction::DockEntity(path) => {
+                self.open_entity_tab(&path);
+            }
             AppAction::RefreshEntity(path) => {
                 if let Some(ns) = ns {
                     self.tab_state(&path).info = Loadable::Loading;
@@ -473,10 +481,20 @@ impl SiftApp {
                     None => SendDialog::new(target),
                 });
             }
+            AppAction::PopOutEntity(path) => {
+                if let Some(location) = self.dock.find_tab(&TabId::Entity(path.clone())) {
+                    self.dock.remove_tab(location);
+                }
+                if !self.popped_out.contains(&path) {
+                    self.popped_out.push(path);
+                }
+            }
         }
     }
 
     fn open_entity_tab(&mut self, path: &EntityPath) {
+        // If it's currently a separate window, reattaching brings it back.
+        self.popped_out.retain(|p| p != path);
         let tab = TabId::Entity(path.clone());
         if let Some(location) = self.dock.find_tab(&tab) {
             if let Err(e) = self.dock.set_active_tab(location) {
@@ -802,6 +820,33 @@ impl SiftApp {
             self.about_window(ctx);
         }
     }
+
+    /// Render each detached entity as its own OS window via an immediate
+    /// viewport, so it can borrow app state directly. A native close removes
+    /// the window (the entity stays cached and can be reopened from the tree).
+    fn show_popped_out(&mut self, ctx: &egui::Context, actions: &mut Vec<AppAction>) {
+        let popped = std::mem::take(&mut self.popped_out);
+        let conn = &self.conn;
+        let entities = &mut self.open_entities;
+        let peek_batch = self.config.ui.peek_batch;
+        let mut still_open = Vec::with_capacity(popped.len());
+
+        for path in popped {
+            let viewport_id = egui::ViewportId::from_hash_of(("sift-entity-window", &path));
+            let builder = egui::ViewportBuilder::default()
+                .with_title(format!("sift — {}", path.name()))
+                .with_inner_size([900.0, 640.0]);
+
+            let closed = ctx.show_viewport_immediate(viewport_id, builder, |ui, _class| {
+                tabs::render_entity(ui, conn, entities, peek_batch, &path, true, actions);
+                ui.input(|i| i.viewport().close_requested())
+            });
+            if !closed {
+                still_open.push(path);
+            }
+        }
+        self.popped_out = still_open;
+    }
 }
 
 /// Extract the user-settable description from a full entity snapshot.
@@ -873,6 +918,7 @@ impl eframe::App for SiftApp {
         };
         DockArea::new(&mut self.dock).show_inside(ui, &mut viewer);
 
+        self.show_popped_out(&ctx, &mut actions);
         self.show_dialogs(&ctx);
 
         for action in actions {

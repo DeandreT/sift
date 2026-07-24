@@ -35,7 +35,15 @@ impl egui_dock::TabViewer for TabViewerCtx<'_> {
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut TabId) {
         match tab {
             TabId::Welcome => self.welcome(ui),
-            TabId::Entity(path) => self.entity(ui, path),
+            TabId::Entity(path) => render_entity(
+                ui,
+                self.conn,
+                self.entities,
+                self.peek_batch,
+                path,
+                false,
+                self.actions,
+            ),
         }
     }
 
@@ -77,20 +85,34 @@ impl TabViewerCtx<'_> {
             }
         });
     }
+}
 
-    fn entity(&mut self, ui: &mut egui::Ui, path: &EntityPath) {
-        if !matches!(self.conn, ConnectionState::Connected { .. }) {
-            ui.add_space(16.0);
-            ui.label(egui::RichText::new("Not connected.").weak());
-            return;
-        }
-        let state = self
-            .entities
-            .entry(path.clone())
-            .or_insert_with(|| EntityTabState::new(self.peek_batch));
+/// Render one entity's content (overview + message pages). Shared by the
+/// docked tab and by a popped-out viewport, so `popped` selects whether the
+/// toolbar offers "Pop out" (dock → window) or "Dock" (window → dock).
+pub fn render_entity(
+    ui: &mut egui::Ui,
+    conn: &ConnectionState,
+    entities: &mut HashMap<EntityPath, EntityTabState>,
+    peek_batch: u32,
+    path: &EntityPath,
+    popped: bool,
+    actions: &mut Vec<AppAction>,
+) {
+    if !matches!(conn, ConnectionState::Connected { .. }) {
+        ui.add_space(16.0);
+        ui.label(egui::RichText::new("Not connected.").weak());
+        return;
+    }
+    let state = entities
+        .entry(path.clone())
+        .or_insert_with(|| EntityTabState::new(peek_batch));
 
-        // Queues and subscriptions get message-browsing pages.
-        if matches!(path, EntityPath::Queue(_) | EntityPath::Subscription { .. }) {
+    // Top row: page selector (message-capable entities) plus a pop-out /
+    // dock toggle pinned to the right.
+    let message_pages = matches!(path, EntityPath::Queue(_) | EntityPath::Subscription { .. });
+    ui.horizontal(|ui| {
+        if message_pages {
             let dlq_count = match &state.info {
                 Loadable::Loaded(sift_backend::EntityInfo::Queue(q)) => {
                     Some(q.runtime.count_details.dead_letter)
@@ -100,64 +122,82 @@ impl TabViewerCtx<'_> {
                 }
                 _ => None,
             };
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut state.page, EntityPage::Overview, "Overview");
-                ui.selectable_value(&mut state.page, EntityPage::Messages, "Messages");
-                let dlq_label = dlq_count.map_or_else(
-                    || "Dead-letter".to_owned(),
-                    |n| format!("Dead-letter ({n})"),
-                );
-                ui.selectable_value(&mut state.page, EntityPage::DeadLetter, dlq_label);
-            });
-            ui.separator();
+            ui.selectable_value(&mut state.page, EntityPage::Overview, "Overview");
+            ui.selectable_value(&mut state.page, EntityPage::Messages, "Messages");
+            let dlq_label = dlq_count.map_or_else(
+                || "Dead-letter".to_owned(),
+                |n| format!("Dead-letter ({n})"),
+            );
+            ui.selectable_value(&mut state.page, EntityPage::DeadLetter, dlq_label);
         }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if popped {
+                if ui
+                    .button(format!("{} Dock", egui_phosphor::regular::ARROW_LINE_DOWN))
+                    .on_hover_text("Return this window to the main frame")
+                    .clicked()
+                {
+                    actions.push(AppAction::DockEntity(path.clone()));
+                }
+            } else if ui
+                .button(format!(
+                    "{} Pop out",
+                    egui_phosphor::regular::ARROW_SQUARE_OUT
+                ))
+                .on_hover_text("Detach into a separate window")
+                .clicked()
+            {
+                actions.push(AppAction::PopOutEntity(path.clone()));
+            }
+        });
+    });
+    ui.separator();
 
-        match state.page {
-            EntityPage::Overview => Self::overview(ui, path, state, self.actions),
-            EntityPage::Messages => {
-                let source = MessageSource {
-                    entity: path.clone(),
-                    dead_letter: false,
-                };
-                messages_view::show(ui, &source, &mut state.main, self.actions);
-            }
-            EntityPage::DeadLetter => {
-                let source = MessageSource {
-                    entity: path.clone(),
-                    dead_letter: true,
-                };
-                messages_view::show(ui, &source, &mut state.dead_letter, self.actions);
-            }
+    match state.page {
+        EntityPage::Overview => overview(ui, path, state, actions),
+        EntityPage::Messages => {
+            let source = MessageSource {
+                entity: path.clone(),
+                dead_letter: false,
+            };
+            messages_view::show(ui, &source, &mut state.main, actions);
+        }
+        EntityPage::DeadLetter => {
+            let source = MessageSource {
+                entity: path.clone(),
+                dead_letter: true,
+            };
+            messages_view::show(ui, &source, &mut state.dead_letter, actions);
         }
     }
+}
 
-    fn overview(
-        ui: &mut egui::Ui,
-        path: &EntityPath,
-        state: &EntityTabState,
-        actions: &mut Vec<AppAction>,
-    ) {
-        match &state.info {
-            Loadable::NotLoaded => {
+fn overview(
+    ui: &mut egui::Ui,
+    path: &EntityPath,
+    state: &EntityTabState,
+    actions: &mut Vec<AppAction>,
+) {
+    match &state.info {
+        Loadable::NotLoaded => {
+            actions.push(AppAction::RefreshEntity(path.clone()));
+        }
+        Loadable::Loading => {
+            ui.add_space(24.0);
+            ui.vertical_centered(|ui| {
+                ui.spinner();
+                ui.label(format!("Loading {}…", path.name()));
+            });
+        }
+        Loadable::Failed(error) => {
+            ui.add_space(16.0);
+            ui.colored_label(ui.visuals().error_fg_color, error);
+            if ui.button("Retry").clicked() {
                 actions.push(AppAction::RefreshEntity(path.clone()));
             }
-            Loadable::Loading => {
-                ui.add_space(24.0);
-                ui.vertical_centered(|ui| {
-                    ui.spinner();
-                    ui.label(format!("Loading {}…", path.name()));
-                });
-            }
-            Loadable::Failed(error) => {
-                ui.add_space(16.0);
-                ui.colored_label(ui.visuals().error_fg_color, error);
-                if ui.button("Retry").clicked() {
-                    actions.push(AppAction::RefreshEntity(path.clone()));
-                }
-            }
-            Loadable::Loaded(info) => {
-                entity_view::show(ui, info, actions);
-            }
+        }
+        Loadable::Loaded(info) => {
+            entity_view::show(ui, info, actions);
         }
     }
 }
