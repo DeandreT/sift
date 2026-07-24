@@ -5,5 +5,6 @@ pub mod entity_view;
 pub mod log_panel;
 pub mod messages_view;
 pub mod send_dialog;
+pub mod sessions_view;
 pub mod tabs;
 pub mod tree_panel;

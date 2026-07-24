@@ -620,3 +620,91 @@ fn live_scheduled_deferred_export() {
         .expect("delete scratch queue");
     eprintln!("scheduled + deferred + export OK on '{queue_name}'");
 }
+
+#[test]
+fn live_session_browse() {
+    let Ok(connection_string) = std::env::var("SIFT_TEST_SB_CONNECTION_STRING") else {
+        eprintln!("skipped: SIFT_TEST_SB_CONNECTION_STRING not set");
+        return;
+    };
+    if std::env::var("SIFT_TEST_SB_MUTATE").as_deref() != Ok("1") {
+        eprintln!("skipped: SIFT_TEST_SB_MUTATE != 1");
+        return;
+    }
+
+    let conn = NamespaceConnection::parse(&connection_string).expect("valid connection string");
+    let mgmt = ManagementClient::new(&conn).expect("management client");
+    let queue_name = format!("sift-test-sess-{}", uuid::Uuid::new_v4());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime for mgmt calls");
+    // Session-enabled queue.
+    rt.block_on(mgmt.create_queue(&QueueProperties {
+        name: queue_name.clone(),
+        requires_session: true,
+        ..QueueProperties::default()
+    }))
+    .expect("create session queue");
+
+    let (backend, events) = sift_backend::spawn(Arc::new(|| {}));
+    let profile = NamespaceProfile::new_connection_string("live-sess-test".into());
+    let ns = profile.id;
+    backend.send(Command::Connect {
+        req: backend.next_request(),
+        profile,
+        secret: SecretString::from(connection_string.as_str()),
+    });
+    recv_until(&events, |e| match e {
+        Event::Connected { result, .. } => Some(result.expect("connect")),
+        _ => None,
+    });
+
+    let queue_path = EntityPath::Queue(queue_name.clone());
+    // Send two messages to session "alpha".
+    backend.send(Command::SendMessages {
+        req: backend.next_request(),
+        ns,
+        target: queue_path.clone(),
+        messages: (0..2)
+            .map(|i| OutboundMessage {
+                body: format!("session msg {i}"),
+                session_id: Some("alpha".into()),
+                ..OutboundMessage::default()
+            })
+            .collect(),
+    });
+    recv_until(&events, |e| match e {
+        Event::Sent { result, .. } => Some(result.expect("send")),
+        _ => None,
+    });
+
+    // Browse the named session and confirm its id and messages.
+    backend.send(Command::BrowseSession {
+        req: backend.next_request(),
+        ns,
+        source: MessageSource {
+            entity: queue_path,
+            dead_letter: false,
+        },
+        session_id: Some("alpha".into()),
+        count: 10,
+    });
+    let snapshot = recv_until(&events, |e| match e {
+        Event::Session { result, .. } => Some(result.expect("browse session")),
+        _ => None,
+    });
+    assert_eq!(snapshot.session_id, "alpha");
+    assert_eq!(snapshot.messages.len(), 2);
+    assert!(
+        snapshot
+            .messages
+            .iter()
+            .all(|m| m.session_id.as_deref() == Some("alpha"))
+    );
+
+    backend.send(Command::Disconnect { ns });
+    rt.block_on(mgmt.delete_queue(&queue_name))
+        .expect("delete scratch queue");
+    eprintln!("session browse OK on '{queue_name}'");
+}

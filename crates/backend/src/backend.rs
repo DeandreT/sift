@@ -390,6 +390,39 @@ async fn run(mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Command>, sink: Ev
                     });
                 });
             }
+            Command::BrowseSession {
+                req,
+                ns,
+                source,
+                session_id,
+                count,
+            } => {
+                let (sink, state) = (sink.clone(), Arc::clone(&state));
+                tokio::spawn(async move {
+                    let result = match runtime_for(&state, ns).await {
+                        Ok(rt) => {
+                            rt.lock()
+                                .await
+                                .browse_session(&source, session_id, count)
+                                .await
+                        }
+                        Err(e) => Err(e),
+                    };
+                    match &result {
+                        Ok(s) => tracing::info!(
+                            "browsed session '{}' on '{source}' ({} message(s))",
+                            s.session_id,
+                            s.messages.len()
+                        ),
+                        Err(e) => tracing::error!("browse session on '{source}' failed: {e}"),
+                    }
+                    sink.send(Event::Session {
+                        req,
+                        source,
+                        result,
+                    });
+                });
+            }
             Command::ExportNamespace { req, ns, path } => {
                 spawn_op(&sink, &state, ns, move |client, sink| async move {
                     let result = export_namespace(&client, &path).await;

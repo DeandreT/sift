@@ -8,7 +8,7 @@ use sift_backend::{EntityPath, MessageSource};
 use crate::state::{
     AppAction, ConnectionState, DashboardState, EntityPage, EntityTabState, EntityTree, Loadable,
 };
-use crate::ui::{dashboard, entity_view, messages_view};
+use crate::ui::{dashboard, entity_view, messages_view, sessions_view};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum TabId {
@@ -120,6 +120,13 @@ pub fn render_entity(
     // Top row: page selector (message-capable entities) plus a pop-out /
     // dock toggle pinned to the right.
     let message_pages = matches!(path, EntityPath::Queue(_) | EntityPath::Subscription { .. });
+    let requires_session = match &state.info {
+        Loadable::Loaded(sift_backend::EntityInfo::Queue(q)) => q.properties.requires_session,
+        Loadable::Loaded(sift_backend::EntityInfo::Subscription(s)) => {
+            s.properties.requires_session
+        }
+        _ => false,
+    };
     ui.horizontal(|ui| {
         if message_pages {
             let dlq_count = match &state.info {
@@ -138,6 +145,9 @@ pub fn render_entity(
                 |n| format!("Dead-letter ({n})"),
             );
             ui.selectable_value(&mut state.page, EntityPage::DeadLetter, dlq_label);
+            if requires_session {
+                ui.selectable_value(&mut state.page, EntityPage::Sessions, "Sessions");
+            }
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if popped {
@@ -177,6 +187,13 @@ pub fn render_entity(
                 dead_letter: true,
             };
             messages_view::show(ui, &source, &mut state.dead_letter, actions);
+        }
+        EntityPage::Sessions => {
+            let source = MessageSource {
+                entity: path.clone(),
+                dead_letter: false,
+            };
+            sessions_view::show(ui, &source, &mut state.sessions, actions);
         }
     }
 }

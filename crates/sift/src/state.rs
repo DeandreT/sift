@@ -201,6 +201,29 @@ pub enum EntityPage {
     Overview,
     Messages,
     DeadLetter,
+    Sessions,
+}
+
+/// Read-only session browser state for one entity.
+#[derive(Debug, Default)]
+pub struct SessionsView {
+    /// Optional session id to accept; empty accepts the next available.
+    pub session_id_input: String,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub snapshot: Option<sift_backend::SessionSnapshot>,
+    /// Messages peeked per browse.
+    pub fetch_count: u32,
+}
+
+impl SessionsView {
+    #[must_use]
+    pub fn new(fetch_count: u32) -> Self {
+        Self {
+            fetch_count,
+            ..Self::default()
+        }
+    }
 }
 
 /// UI state for one message browsing surface (main queue or DLQ).
@@ -267,6 +290,7 @@ pub struct EntityTabState {
     pub page: EntityPage,
     pub main: MessagesView,
     pub dead_letter: MessagesView,
+    pub sessions: SessionsView,
 }
 
 impl EntityTabState {
@@ -277,6 +301,7 @@ impl EntityTabState {
             page: EntityPage::default(),
             main: MessagesView::new(fetch_count),
             dead_letter: MessagesView::new(fetch_count),
+            sessions: SessionsView::new(fetch_count),
         }
     }
 
@@ -363,6 +388,12 @@ pub enum AppAction {
     ExportNamespace,
     ImportNamespace {
         overwrite: bool,
+    },
+    /// Accept and browse a session (read-only).
+    BrowseSession {
+        source: MessageSource,
+        session_id: Option<String>,
+        count: u32,
     },
 }
 

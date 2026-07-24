@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use sift_core::body::DecodedBody;
 use sift_core::config::NamespaceProfile;
 use sift_core::message::{OutboundMessage, SiftMessage};
 use sift_core::secrets::SecretString;
@@ -166,6 +167,16 @@ pub enum MutationOp {
     Deleted,
 }
 
+/// A read-only snapshot of one message session: the accepted session's id,
+/// its custom state (decoded for display), and its peeked messages.
+#[derive(Debug, Clone)]
+pub struct SessionSnapshot {
+    pub session_id: String,
+    /// The session's custom state; `None` when unset.
+    pub state: Option<DecodedBody>,
+    pub messages: Vec<SiftMessage>,
+}
+
 /// Where messages are browsed from: an entity's main queue or its
 /// dead-letter sub-queue. `entity` is a queue or subscription.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -317,6 +328,16 @@ pub enum Command {
         source: MessageSource,
         sequence_numbers: Vec<i64>,
     },
+    /// Accept a session (next available, or a named one), peek its messages
+    /// and read its state, then release it. Read-only browse.
+    BrowseSession {
+        req: RequestId,
+        ns: NamespaceId,
+        source: MessageSource,
+        /// `None` accepts the next available session.
+        session_id: Option<String>,
+        count: u32,
+    },
     /// Export the namespace's entity descriptions to a JSON file.
     ExportNamespace {
         req: RequestId,
@@ -436,6 +457,11 @@ pub enum Event {
         op: OpId,
         result: Result<OpSummary, BackendError>,
         cancelled: bool,
+    },
+    Session {
+        req: RequestId,
+        source: MessageSource,
+        result: Result<SessionSnapshot, BackendError>,
     },
 }
 

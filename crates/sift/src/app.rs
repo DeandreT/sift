@@ -281,6 +281,17 @@ impl SiftApp {
                 }
                 Err(e) => self.toast(ToastKind::Error, e.message),
             },
+            Event::Session { source, result, .. } => {
+                let view = &mut self.tab_state(&source.entity).sessions;
+                view.loading = false;
+                match result {
+                    Ok(snapshot) => {
+                        view.error = None;
+                        view.snapshot = Some(snapshot);
+                    }
+                    Err(e) => view.error = Some(e.message),
+                }
+            }
             Event::OpProgress {
                 op,
                 kind,
@@ -585,6 +596,25 @@ impl SiftApp {
             }
             AppAction::ExportNamespace => self.export_namespace(),
             AppAction::ImportNamespace { overwrite } => self.import_namespace(overwrite),
+            AppAction::BrowseSession {
+                source,
+                session_id,
+                count,
+            } => {
+                if let Some(ns) = ns {
+                    let view = &mut self.tab_state(&source.entity).sessions;
+                    view.loading = true;
+                    view.error = None;
+                    let req = self.backend.next_request();
+                    self.backend.send(Command::BrowseSession {
+                        req,
+                        ns,
+                        source,
+                        session_id,
+                        count,
+                    });
+                }
+            }
             AppAction::PeekMessages {
                 source,
                 from_seq,

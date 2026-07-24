@@ -261,6 +261,71 @@ impl SbRuntime {
         Ok(out)
     }
 
+    /// Accept a session (next available, or a named one), peek its messages
+    /// and read its state, then release it. Read-only: the session receiver is
+    /// dropped at the end, releasing the session lock for other consumers.
+    pub async fn browse_session(
+        &mut self,
+        source: &MessageSource,
+        session_id: Option<String>,
+        count: u32,
+    ) -> Result<crate::bridge::SessionSnapshot, BackendError> {
+        use azservicebus::ServiceBusSessionReceiverOptions;
+
+        let options = ServiceBusSessionReceiverOptions::default();
+        let mut receiver = match (&source.entity, session_id) {
+            (EntityPath::Queue(name), Some(id)) => self
+                .client
+                .accept_session_for_queue(name.clone(), id, options)
+                .await
+                .map_err(amqp_err)?,
+            (EntityPath::Queue(name), None) => self
+                .client
+                .accept_next_session_for_queue(name.clone(), options)
+                .await
+                .map_err(amqp_err)?,
+            (EntityPath::Subscription { topic, name }, Some(id)) => self
+                .client
+                .accept_session_for_subscription(topic, name, id, options)
+                .await
+                .map_err(amqp_err)?,
+            (EntityPath::Subscription { topic, name }, None) => self
+                .client
+                .accept_next_session_for_subscription(topic, name, options)
+                .await
+                .map_err(amqp_err)?,
+            (other, _) => {
+                return Err(BackendError::new(format!(
+                    "cannot browse sessions on a {}",
+                    other.kind()
+                )));
+            }
+        };
+
+        let session_id = receiver.session_id().to_owned();
+        let peeked = receiver
+            .peek_messages(count, Some(0))
+            .await
+            .map_err(amqp_err)?;
+        let messages = peeked.iter().map(from_peeked).collect();
+        let state = match receiver.session_state().await {
+            Ok(bytes) if bytes.is_empty() => None,
+            Ok(bytes) => Some(decode(bytes)),
+            Err(e) => {
+                tracing::debug!("could not read session state: {e}");
+                None
+            }
+        };
+        // Dropping the receiver releases the session lock.
+        let _ = receiver.dispose().await;
+
+        Ok(crate::bridge::SessionSnapshot {
+            session_id,
+            state,
+            messages,
+        })
+    }
+
     /// Get (or open) the sender for a queue or topic.
     async fn sender(&mut self, target: &EntityPath) -> Result<&mut ServiceBusSender, BackendError> {
         let path = match target {
