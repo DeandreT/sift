@@ -201,13 +201,25 @@ fn header(ui: &mut egui::Ui, path: &EntityPath, info: &EntityInfo, actions: &mut
             {
                 actions.push(AppAction::RefreshEntity(path.clone()));
             }
+            if matches!(path, EntityPath::Queue(_) | EntityPath::Topic(_))
+                && ui
+                    .button(format!(
+                        "{} Send…",
+                        egui_phosphor::regular::PAPER_PLANE_TILT
+                    ))
+                    .clicked()
+            {
+                actions.push(AppAction::OpenSendDialog {
+                    target: path.clone(),
+                    prefill: None,
+                });
+            }
             status_selector(ui, info, actions);
         });
     });
 }
 
-/// Status dropdown that immediately applies a change (parity with the ref
-/// app's Change Status action).
+/// Status dropdown that immediately applies a change to the service.
 fn status_selector(ui: &mut egui::Ui, info: &EntityInfo, actions: &mut Vec<AppAction>) {
     let current = match info {
         EntityInfo::Queue(q) => q.properties.status,

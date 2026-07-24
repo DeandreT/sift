@@ -26,6 +26,9 @@ egui-toast = "0.21"
 egui_dock = "0.20"
 egui_extras = "0.35"
 
+# Azure Service Bus AMQP runtime (community crate; no official SDK exists)
+azservicebus = { version = "0.25", default-features = false, features = ["rustls"] }
+
 # Async runtime and channels
 crossbeam-channel = "0.5"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
@@ -35,6 +38,9 @@ tokio-util = "0.7"
 quick-xml = "0.41"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 roxmltree = "0.21"
+
+# Body decoding
+flate2 = "1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -75,6 +81,9 @@ missing_panics_doc = "allow"
 module_name_repetitions = "allow"
 # Entity models mirror the Service Bus schema, which is bool-heavy.
 struct_excessive_bools = "allow"
+# The azservicebus AMQP futures are inherently large (~30 KB); boxing every
+# call site would add noise without meaningful benefit for a desktop app.
+large_futures = "allow"
 must_use_candidate = "allow"
 # Hard lines.
 dbg_macro = "warn"

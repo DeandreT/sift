@@ -1,5 +1,5 @@
-//! Modal dialogs: typed-name delete confirmation (ports the reference app's
-//! accidental-deletion guard) and entity creation forms.
+//! Modal dialogs: typed-name delete confirmation (the entity name must be
+//! typed back to arm the delete button) and entity creation forms.
 
 use sift_backend::{EntityDescription, EntityPath};
 use sift_mgmt::{

@@ -11,8 +11,8 @@ mod ui;
 fn main() -> eframe::Result {
     let log = logging::init();
 
-    // Headless import: `sift --import-legacy [path]` migrates Service Bus
-    // Explorer profiles into the config + OS secret store and exits.
+    // Headless import: `sift --import-legacy <path>` migrates namespace
+    // profiles from a legacy XML config into the config + OS secret store.
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(pos) = args.iter().position(|a| a == "--import-legacy") {
         import_legacy_and_exit(args.get(pos + 1).map(std::path::PathBuf::from));
@@ -36,11 +36,8 @@ fn main() -> eframe::Result {
 }
 
 fn import_legacy_and_exit(path: Option<std::path::PathBuf>) {
-    let Some(path) = path.or_else(sift_core::legacy_import::default_user_config_path) else {
-        tracing::error!(
-            "no path given and no legacy explorer tool user config found; \
-             pass one: sift --import-legacy <path-to-config>"
-        );
+    let Some(path) = path else {
+        tracing::error!("usage: sift --import-legacy <path-to-config>");
         std::process::exit(1);
     };
 

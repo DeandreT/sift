@@ -13,10 +13,14 @@ use crate::bridge::{
     BackendError, BackendHandle, Command, EntityDescription, EntityInfo, EntityPath, Event,
     MutationOp, NamespaceId, RequestId,
 };
+use crate::sb_runtime::SbRuntime;
 
 /// Called after every event so the UI repaints promptly; the GUI passes
 /// `egui::Context::request_repaint` without this crate depending on egui.
 pub type RepaintFn = Arc<dyn Fn() + Send + Sync>;
+
+/// How long a receive waits for messages before returning what it has.
+const RECEIVE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Start the backend thread. Returns the command handle and the event
 /// receiver the UI drains each frame.
@@ -55,13 +59,22 @@ impl EventSink {
     }
 }
 
+/// Everything held for one connected namespace.
+struct NamespaceState {
+    mgmt: Arc<ManagementClient>,
+    conn: NamespaceConnection,
+    /// AMQP runtime, created lazily on the first messaging operation.
+    sb: Option<Arc<Mutex<SbRuntime>>>,
+}
+
 #[derive(Default)]
 struct State {
-    namespaces: HashMap<NamespaceId, Arc<ManagementClient>>,
+    namespaces: HashMap<NamespaceId, NamespaceState>,
 }
 
 type SharedState = Arc<Mutex<State>>;
 
+#[allow(clippy::too_many_lines)] // one match arm per command; splitting hurts readability
 async fn run(mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Command>, sink: EventSink) {
     let state: SharedState = Arc::default();
     tracing::debug!("backend runtime started");
@@ -89,7 +102,10 @@ async fn run(mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Command>, sink: Ev
                 });
             }
             Command::Disconnect { ns } => {
-                state.lock().await.namespaces.remove(&ns);
+                let removed = state.lock().await.namespaces.remove(&ns);
+                if let Some(NamespaceState { sb: Some(sb), .. }) = removed {
+                    tokio::spawn(async move { sb.lock().await.shutdown().await });
+                }
                 tracing::info!(%ns, "disconnected");
                 sink.send(Event::Disconnected { ns });
             }
@@ -154,15 +170,127 @@ async fn run(mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Command>, sink: Ev
                     });
                 });
             }
+            Command::PeekMessages {
+                req,
+                ns,
+                source,
+                from_seq,
+                count,
+            } => {
+                let (sink, state) = (sink.clone(), Arc::clone(&state));
+                tokio::spawn(async move {
+                    let result = match runtime_for(&state, ns).await {
+                        Ok(rt) => rt.lock().await.peek(&source, from_seq, count).await,
+                        Err(e) => Err(e),
+                    };
+                    if let Err(e) = &result {
+                        tracing::error!("peek from '{source}' failed: {e}");
+                    }
+                    sink.send(Event::Messages {
+                        req,
+                        source,
+                        from_seq,
+                        received: false,
+                        result,
+                    });
+                });
+            }
+            Command::ReceiveMessages {
+                req,
+                ns,
+                source,
+                mode,
+                count,
+            } => {
+                let (sink, state) = (sink.clone(), Arc::clone(&state));
+                tokio::spawn(async move {
+                    let result = match runtime_for(&state, ns).await {
+                        Ok(rt) => {
+                            rt.lock()
+                                .await
+                                .receive(&source, mode, count, RECEIVE_WAIT)
+                                .await
+                        }
+                        Err(e) => Err(e),
+                    };
+                    match &result {
+                        Ok(messages) => {
+                            tracing::info!("received {} messages from '{source}'", messages.len());
+                        }
+                        Err(e) => tracing::error!("receive from '{source}' failed: {e}"),
+                    }
+                    sink.send(Event::Messages {
+                        req,
+                        source,
+                        from_seq: None,
+                        received: true,
+                        result,
+                    });
+                });
+            }
+            Command::SettleMessage {
+                req,
+                ns,
+                source,
+                lock_token,
+                disposition,
+            } => {
+                let (sink, state) = (sink.clone(), Arc::clone(&state));
+                tokio::spawn(async move {
+                    let result = match runtime_for(&state, ns).await {
+                        Ok(rt) => {
+                            rt.lock()
+                                .await
+                                .settle(&lock_token, disposition.clone())
+                                .await
+                        }
+                        Err(e) => Err(e),
+                    };
+                    match &result {
+                        Ok(()) => tracing::info!("{} message on '{source}'", disposition.verb()),
+                        Err(e) => tracing::error!("settle on '{source}' failed: {e}"),
+                    }
+                    sink.send(Event::Settled {
+                        req,
+                        source,
+                        lock_token,
+                        disposition,
+                        result,
+                    });
+                });
+            }
+            Command::SendMessages {
+                req,
+                ns,
+                target,
+                messages,
+            } => {
+                let (sink, state) = (sink.clone(), Arc::clone(&state));
+                tokio::spawn(async move {
+                    let count = messages.len();
+                    let result = match runtime_for(&state, ns).await {
+                        Ok(rt) => rt.lock().await.send(&target, messages).await.map(|_| ()),
+                        Err(e) => Err(e),
+                    };
+                    match &result {
+                        Ok(()) => tracing::info!("sent {count} message(s) to '{target}'"),
+                        Err(e) => tracing::error!("send to '{target}' failed: {e}"),
+                    }
+                    sink.send(Event::Sent {
+                        req,
+                        target,
+                        count,
+                        result,
+                    });
+                });
+            }
             Command::Shutdown => break,
         }
     }
     tracing::debug!("backend runtime stopped");
 }
 
-/// Look up the namespace's client and run `op` on a fresh task. Emits nothing
-/// when the namespace is no longer connected — any pending UI state for it is
-/// already being torn down.
+/// Look up the namespace's management client and run `op` on a fresh task.
 fn spawn_op<F, Fut>(sink: &EventSink, state: &SharedState, ns: NamespaceId, op: F)
 where
     F: FnOnce(Arc<ManagementClient>, EventSink) -> Fut + Send + 'static,
@@ -170,13 +298,47 @@ where
 {
     let (sink, state) = (sink.clone(), Arc::clone(state));
     tokio::spawn(async move {
-        let client = state.lock().await.namespaces.get(&ns).cloned();
+        let client = state
+            .lock()
+            .await
+            .namespaces
+            .get(&ns)
+            .map(|n| Arc::clone(&n.mgmt));
         if let Some(client) = client {
             op(client, sink).await;
         } else {
             tracing::warn!(%ns, "command for a namespace that is not connected");
         }
     });
+}
+
+/// Get the namespace's AMQP runtime, establishing the connection on first use.
+async fn runtime_for(
+    state: &SharedState,
+    ns: NamespaceId,
+) -> Result<Arc<Mutex<SbRuntime>>, BackendError> {
+    let conn = {
+        let guard = state.lock().await;
+        let Some(nss) = guard.namespaces.get(&ns) else {
+            return Err(BackendError::new("not connected to this namespace"));
+        };
+        if let Some(sb) = &nss.sb {
+            return Ok(Arc::clone(sb));
+        }
+        nss.conn.clone()
+    };
+
+    let runtime = Arc::new(Mutex::new(SbRuntime::connect(&conn).await?));
+    let mut guard = state.lock().await;
+    let Some(nss) = guard.namespaces.get_mut(&ns) else {
+        return Err(BackendError::new("not connected to this namespace"));
+    };
+    // Another task may have connected the runtime while we awaited; prefer it.
+    if let Some(existing) = &nss.sb {
+        return Ok(Arc::clone(existing));
+    }
+    nss.sb = Some(Arc::clone(&runtime));
+    Ok(runtime)
 }
 
 fn mutate(
@@ -235,7 +397,7 @@ async fn apply_mutation(
         }),
         EntityDescription::Rule(p) => {
             if update {
-                // Rules have no update: recreate under If-None semantics.
+                // Rules have no update: recreate.
                 client
                     .delete_rule(&p.topic, &p.subscription, &p.name)
                     .await
@@ -307,6 +469,13 @@ async fn connect(
 
     let client = ManagementClient::new(&conn)?;
     let info = client.get_namespace_info().await?;
-    state.lock().await.namespaces.insert(ns, Arc::new(client));
+    state.lock().await.namespaces.insert(
+        ns,
+        NamespaceState {
+            mgmt: Arc::new(client),
+            conn,
+            sb: None,
+        },
+    );
     Ok(info)
 }

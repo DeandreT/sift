@@ -3,7 +3,8 @@
 
 use std::collections::HashMap;
 
-use sift_backend::{EntityInfo, EntityPath, RequestId};
+use sift_backend::{Disposition, EntityInfo, EntityPath, MessageSource, ReceiveMode, RequestId};
+use sift_core::message::{OutboundMessage, SiftMessage};
 use sift_mgmt::{NamespaceInfo, QueueInfo, RuleInfo, SubscriptionInfo, TopicInfo};
 use uuid::Uuid;
 
@@ -91,6 +92,97 @@ impl EntityTree {
     }
 }
 
+/// Inner page of an entity tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EntityPage {
+    #[default]
+    Overview,
+    Messages,
+    DeadLetter,
+}
+
+/// UI state for one message browsing surface (main queue or DLQ).
+#[derive(Debug)]
+pub struct MessagesView {
+    pub rows: Vec<SiftMessage>,
+    pub selected: Option<usize>,
+    pub loading: bool,
+    pub error: Option<String>,
+    /// Messages fetched per peek/receive.
+    pub fetch_count: u32,
+    /// Body viewer: show hex instead of text.
+    pub show_hex: bool,
+}
+
+impl MessagesView {
+    #[must_use]
+    pub fn new(fetch_count: u32) -> Self {
+        Self {
+            rows: Vec::new(),
+            selected: None,
+            loading: false,
+            error: None,
+            fetch_count,
+            show_hex: false,
+        }
+    }
+
+    /// Sequence number to continue peeking from.
+    #[must_use]
+    pub fn next_seq(&self) -> Option<i64> {
+        self.rows.last().map(|m| m.sequence_number + 1)
+    }
+
+    #[must_use]
+    pub fn selected_message(&self) -> Option<&SiftMessage> {
+        self.selected.and_then(|i| self.rows.get(i))
+    }
+
+    pub fn remove_by_lock_token(&mut self, token: &str) {
+        if let Some(pos) = self
+            .rows
+            .iter()
+            .position(|m| m.lock_token.as_deref() == Some(token))
+        {
+            self.rows.remove(pos);
+            match self.selected {
+                Some(s) if s == pos => self.selected = None,
+                Some(s) if s > pos => self.selected = Some(s - 1),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Everything an open entity tab owns.
+#[derive(Debug)]
+pub struct EntityTabState {
+    pub info: Loadable<EntityInfo>,
+    pub page: EntityPage,
+    pub main: MessagesView,
+    pub dead_letter: MessagesView,
+}
+
+impl EntityTabState {
+    #[must_use]
+    pub fn new(fetch_count: u32) -> Self {
+        Self {
+            info: Loadable::NotLoaded,
+            page: EntityPage::default(),
+            main: MessagesView::new(fetch_count),
+            dead_letter: MessagesView::new(fetch_count),
+        }
+    }
+
+    pub fn view_mut(&mut self, dead_letter: bool) -> &mut MessagesView {
+        if dead_letter {
+            &mut self.dead_letter
+        } else {
+            &mut self.main
+        }
+    }
+}
+
 /// What kind of entity a create dialog is building.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreateKind {
@@ -118,4 +210,23 @@ pub enum AppAction {
     UpdateEntity(Box<EntityInfo>),
     OpenCreateDialog(CreateKind),
     RequestDelete(EntityPath),
+    PeekMessages {
+        source: MessageSource,
+        from_seq: Option<i64>,
+        count: u32,
+    },
+    ReceiveMessages {
+        source: MessageSource,
+        mode: ReceiveMode,
+        count: u32,
+    },
+    Settle {
+        source: MessageSource,
+        lock_token: String,
+        disposition: Disposition,
+    },
+    OpenSendDialog {
+        target: EntityPath,
+        prefill: Option<Box<OutboundMessage>>,
+    },
 }

@@ -4,10 +4,12 @@
 //! This crate is deliberately free of async runtimes, Azure SDKs, and GUI
 //! dependencies so that every piece of it is unit-testable in isolation.
 
+pub mod body;
 pub mod config;
 pub mod connection;
-pub mod sas;
 pub mod legacy_import;
+pub mod message;
+pub mod sas;
 pub mod secrets;
 
 pub use config::{AppConfig, AuthMethod, NamespaceProfile};

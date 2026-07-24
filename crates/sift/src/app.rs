@@ -7,7 +7,8 @@ use std::sync::Arc;
 use egui_dock::{DockArea, DockState};
 use egui_toast::{Toast, ToastKind, ToastOptions, Toasts};
 use sift_backend::{
-    BackendHandle, Command, EntityDescription, EntityInfo, EntityPath, Event, MutationOp,
+    BackendHandle, Command, Disposition, EntityDescription, EntityInfo, EntityPath, Event,
+    MutationOp,
 };
 use sift_core::config::{AppConfig, NamespaceProfile, ThemePreference};
 use sift_core::connection::NamespaceConnection;
@@ -15,11 +16,14 @@ use sift_core::secrets::{SecretKind, SecretRef, SecretStore, SecretString};
 use uuid::Uuid;
 
 use crate::logging::LogBuffer;
-use crate::state::{AppAction, ConnectionState, EntityTree, Loadable, PendingConnect};
+use crate::state::{
+    AppAction, ConnectionState, EntityTabState, EntityTree, Loadable, PendingConnect,
+};
 use crate::ui::connect_dialog::{ConnectDialog, DialogAction};
 use crate::ui::dialogs::{ConfirmDeleteAction, ConfirmDeleteDialog, CreateAction, CreateDialog};
+use crate::ui::send_dialog::{SendAction, SendDialog};
 use crate::ui::tabs::{TabId, TabViewerCtx};
-use crate::ui::{connect_dialog, dialogs, log_panel, tree_panel};
+use crate::ui::{connect_dialog, dialogs, log_panel, send_dialog, tree_panel};
 
 pub struct SiftApp {
     backend: BackendHandle,
@@ -29,13 +33,14 @@ pub struct SiftApp {
     conn: ConnectionState,
     pending_connect: Option<PendingConnect>,
     tree: EntityTree,
-    open_entities: HashMap<EntityPath, Loadable<EntityInfo>>,
+    open_entities: HashMap<EntityPath, EntityTabState>,
     dock: DockState<TabId>,
     log: LogBuffer,
     log_visible: bool,
     connect_dialog: Option<ConnectDialog>,
     confirm_delete: Option<ConfirmDeleteDialog>,
     create_dialog: Option<CreateDialog>,
+    send_dialog: Option<SendDialog>,
     about_open: bool,
     toasts: Toasts,
 }
@@ -77,6 +82,7 @@ impl SiftApp {
             connect_dialog: None,
             confirm_delete: None,
             create_dialog: None,
+            send_dialog: None,
             about_open: false,
             toasts: Toasts::new()
                 .anchor(egui::Align2::RIGHT_BOTTOM, (-12.0, -12.0))
@@ -96,6 +102,7 @@ impl SiftApp {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // one arm per event variant
     fn apply_event(&mut self, event: Event) {
         match event {
             Event::Connected { req, ns, result } => {
@@ -153,16 +160,91 @@ impl SiftApp {
                     .insert((topic, subscription), load_result(result, &mut self.toasts));
             }
             Event::Entity { path, result, .. } => {
-                let state = match result {
+                let info = match result {
                     Ok(info) => Loadable::Loaded(info),
                     Err(e) => Loadable::Failed(e.message),
                 };
-                self.open_entities.insert(path, state);
+                self.tab_state(&path).info = info;
             }
             Event::Mutated {
                 op, path, result, ..
             } => self.apply_mutation_event(op, path, result),
+            Event::Messages {
+                source,
+                from_seq,
+                result,
+                ..
+            } => {
+                let view = self.tab_state(&source.entity).view_mut(source.dead_letter);
+                view.loading = false;
+                match result {
+                    Ok(mut messages) => {
+                        view.error = None;
+                        if from_seq.is_some() {
+                            view.rows.append(&mut messages);
+                        } else {
+                            view.rows = messages;
+                            view.selected = None;
+                        }
+                    }
+                    Err(e) => view.error = Some(e.message),
+                }
+            }
+            Event::Settled {
+                source,
+                lock_token,
+                disposition,
+                result,
+                ..
+            } => match result {
+                Ok(()) => {
+                    let view = self.tab_state(&source.entity).view_mut(source.dead_letter);
+                    if disposition == Disposition::Abandon {
+                        // The message stays; our lock is just gone.
+                        if let Some(row) = view
+                            .rows
+                            .iter_mut()
+                            .find(|m| m.lock_token.as_deref() == Some(lock_token.as_str()))
+                        {
+                            row.lock_token = None;
+                        }
+                    } else {
+                        view.remove_by_lock_token(&lock_token);
+                    }
+                    self.toast(
+                        ToastKind::Success,
+                        format!("{} the message", disposition.verb()),
+                    );
+                    // Counts changed; refresh the overview.
+                    self.run_action(AppAction::RefreshEntity(source.entity));
+                }
+                Err(e) => self.toast(ToastKind::Error, e.message),
+            },
+            Event::Sent {
+                target,
+                count,
+                result,
+                ..
+            } => match result {
+                Ok(()) => {
+                    self.toast(
+                        ToastKind::Success,
+                        format!("Sent {count} message(s) to '{target}'"),
+                    );
+                    if self.open_entities.contains_key(&target) {
+                        self.run_action(AppAction::RefreshEntity(target));
+                    }
+                }
+                Err(e) => self.toast(ToastKind::Error, e.message),
+            },
         }
+    }
+
+    /// Tab state for an entity, created on demand.
+    fn tab_state(&mut self, path: &EntityPath) -> &mut EntityTabState {
+        self.open_entities
+            .entry(path.clone())
+            .or_insert_with(|| EntityTabState::new(self.config.ui.peek_batch))
     }
 
     fn apply_mutation_event(
@@ -192,8 +274,7 @@ impl SiftApp {
                     }
                     MutationOp::Created | MutationOp::Updated => {
                         if let Some(info) = info {
-                            self.open_entities
-                                .insert(path.clone(), Loadable::Loaded(info));
+                            self.tab_state(&path).info = Loadable::Loaded(info);
                         }
                     }
                 }
@@ -244,6 +325,7 @@ impl SiftApp {
 
     // ---- actions ---------------------------------------------------------
 
+    #[allow(clippy::too_many_lines)] // one arm per action variant
     fn run_action(&mut self, action: AppAction) {
         let ns = self.namespace_id();
         match action {
@@ -307,10 +389,10 @@ impl SiftApp {
                 }
             }
             AppAction::RefreshTree => self.tree.clear(),
-            AppAction::OpenEntity(path) => self.open_entity_tab(path),
+            AppAction::OpenEntity(path) => self.open_entity_tab(&path),
             AppAction::RefreshEntity(path) => {
                 if let Some(ns) = ns {
-                    self.open_entities.insert(path.clone(), Loadable::Loading);
+                    self.tab_state(&path).info = Loadable::Loading;
                     let req = self.backend.next_request();
                     self.backend.send(Command::GetEntity { req, ns, path });
                 }
@@ -331,17 +413,77 @@ impl SiftApp {
                     self.config.ui.confirm_delete_typed_name,
                 ));
             }
+            AppAction::PeekMessages {
+                source,
+                from_seq,
+                count,
+            } => {
+                if let Some(ns) = ns {
+                    let view = self.tab_state(&source.entity).view_mut(source.dead_letter);
+                    view.loading = true;
+                    view.error = None;
+                    let req = self.backend.next_request();
+                    self.backend.send(Command::PeekMessages {
+                        req,
+                        ns,
+                        source,
+                        from_seq,
+                        count,
+                    });
+                }
+            }
+            AppAction::ReceiveMessages {
+                source,
+                mode,
+                count,
+            } => {
+                if let Some(ns) = ns {
+                    let view = self.tab_state(&source.entity).view_mut(source.dead_letter);
+                    view.loading = true;
+                    view.error = None;
+                    let req = self.backend.next_request();
+                    self.backend.send(Command::ReceiveMessages {
+                        req,
+                        ns,
+                        source,
+                        mode,
+                        count,
+                    });
+                }
+            }
+            AppAction::Settle {
+                source,
+                lock_token,
+                disposition,
+            } => {
+                if let Some(ns) = ns {
+                    let req = self.backend.next_request();
+                    self.backend.send(Command::SettleMessage {
+                        req,
+                        ns,
+                        source,
+                        lock_token,
+                        disposition,
+                    });
+                }
+            }
+            AppAction::OpenSendDialog { target, prefill } => {
+                self.send_dialog = Some(match prefill {
+                    Some(outbound) => SendDialog::prefilled(target, *outbound),
+                    None => SendDialog::new(target),
+                });
+            }
         }
     }
 
-    fn open_entity_tab(&mut self, path: EntityPath) {
+    fn open_entity_tab(&mut self, path: &EntityPath) {
         let tab = TabId::Entity(path.clone());
         if let Some(location) = self.dock.find_tab(&tab) {
             if let Err(e) = self.dock.set_active_tab(location) {
                 tracing::debug!("could not focus tab: {e:?}");
             }
         } else {
-            self.open_entities.entry(path).or_default();
+            self.tab_state(path);
             self.dock.push_to_focused_leaf(tab);
         }
     }
@@ -467,12 +609,10 @@ impl SiftApp {
 
     fn import_legacy_profiles(&mut self) {
         let mut picker = rfd::FileDialog::new()
-            .set_title("Select a legacy explorer tool config")
+            .set_title("Select a namespaces config file")
             .add_filter("Config files", &["config", "xml"]);
-        if let Some(default) = sift_core::legacy_import::default_user_config_path()
-            && let Some(dir) = default.parent()
-        {
-            picker = picker.set_directory(dir);
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            picker = picker.set_directory(appdata);
         }
         let Some(path) = picker.pick_file() else {
             return;
@@ -491,7 +631,7 @@ impl SiftApp {
                     tracing::warn!("skipped '{name}': {reason}");
                 }
                 self.persist_config();
-                tracing::info!("imported legacy explorer tool profiles: {report}");
+                tracing::info!("imported legacy profiles: {report}");
                 self.toast(ToastKind::Success, format!("Import finished: {report}"));
             }
             Err(e) => {
@@ -537,7 +677,7 @@ impl SiftApp {
                     ui.close();
                 }
                 ui.separator();
-                if ui.button("Import from legacy explorer tool…").clicked() {
+                if ui.button("Import legacy profiles…").clicked() {
                     actions.push(AppAction::ImportLegacyProfiles);
                     ui.close();
                 }
@@ -590,10 +730,7 @@ impl SiftApp {
             .show(ctx, |ui| {
                 ui.label(format!("sift v{}", env!("CARGO_PKG_VERSION")));
                 ui.label("A cross-platform Azure Service Bus explorer.");
-                ui.label(
-                    egui::RichText::new("Rust rewrite of legacy explorer tool, built on egui.")
-                        .weak(),
-                );
+                ui.label(egui::RichText::new("Built with Rust and egui.").weak());
             });
         self.about_open = open;
     }
@@ -637,6 +774,27 @@ impl SiftApp {
                 },
                 Some(CreateAction::Close) => {}
                 None => self.create_dialog = Some(dialog),
+            }
+        }
+
+        if let Some(mut dialog) = self.send_dialog.take() {
+            match send_dialog::show(ctx, &mut dialog) {
+                Some(SendAction::Send) => match dialog.build() {
+                    Some(messages) => {
+                        if let Some(ns) = self.namespace_id() {
+                            let req = self.backend.next_request();
+                            self.backend.send(Command::SendMessages {
+                                req,
+                                ns,
+                                target: dialog.target.clone(),
+                                messages,
+                            });
+                        }
+                    }
+                    None => self.send_dialog = Some(dialog), // validation error shown inline
+                },
+                Some(SendAction::Close) => {}
+                None => self.send_dialog = Some(dialog),
             }
         }
 
@@ -709,7 +867,8 @@ impl eframe::App for SiftApp {
         // The dock fills the remaining central space.
         let mut viewer = TabViewerCtx {
             conn: &self.conn,
-            entities: &self.open_entities,
+            entities: &mut self.open_entities,
+            peek_batch: self.config.ui.peek_batch,
             actions: &mut actions,
         };
         DockArea::new(&mut self.dock).show_inside(ui, &mut viewer);

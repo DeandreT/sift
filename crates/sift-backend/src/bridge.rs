@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sift_core::config::NamespaceProfile;
+use sift_core::message::{OutboundMessage, SiftMessage};
 use sift_core::secrets::SecretString;
 use sift_mgmt::{
     MgmtError, NamespaceInfo, QueueInfo, QueueProperties, RuleInfo, RuleProperties,
@@ -135,6 +136,54 @@ pub enum MutationOp {
     Deleted,
 }
 
+/// Where messages are browsed from: an entity's main queue or its
+/// dead-letter sub-queue. `entity` is a queue or subscription.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct MessageSource {
+    pub entity: EntityPath,
+    pub dead_letter: bool,
+}
+
+impl std::fmt::Display for MessageSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.dead_letter {
+            write!(f, "{}/$DeadLetterQueue", self.entity)
+        } else {
+            self.entity.fmt(f)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReceiveMode {
+    PeekLock,
+    ReceiveAndDelete,
+}
+
+/// How to settle a peek-locked message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Disposition {
+    Complete,
+    Abandon,
+    Defer,
+    DeadLetter {
+        reason: Option<String>,
+        description: Option<String>,
+    },
+}
+
+impl Disposition {
+    #[must_use]
+    pub fn verb(&self) -> &'static str {
+        match self {
+            Self::Complete => "Completed",
+            Self::Abandon => "Abandoned",
+            Self::Defer => "Deferred",
+            Self::DeadLetter { .. } => "Dead-lettered",
+        }
+    }
+}
+
 /// UI → backend.
 #[derive(Debug)]
 pub enum Command {
@@ -187,6 +236,34 @@ pub enum Command {
         ns: NamespaceId,
         path: EntityPath,
     },
+    PeekMessages {
+        req: RequestId,
+        ns: NamespaceId,
+        source: MessageSource,
+        /// Peek from this sequence number onward; `None` starts at the front.
+        from_seq: Option<i64>,
+        count: u32,
+    },
+    ReceiveMessages {
+        req: RequestId,
+        ns: NamespaceId,
+        source: MessageSource,
+        mode: ReceiveMode,
+        count: u32,
+    },
+    SettleMessage {
+        req: RequestId,
+        ns: NamespaceId,
+        source: MessageSource,
+        lock_token: String,
+        disposition: Disposition,
+    },
+    SendMessages {
+        req: RequestId,
+        ns: NamespaceId,
+        target: EntityPath,
+        messages: Vec<OutboundMessage>,
+    },
     Shutdown,
 }
 
@@ -230,6 +307,29 @@ pub enum Event {
         op: MutationOp,
         path: EntityPath,
         result: Result<Option<EntityInfo>, BackendError>,
+    },
+    Messages {
+        req: RequestId,
+        source: MessageSource,
+        /// The `from_seq` of the request; `Some` means "append to the view".
+        from_seq: Option<i64>,
+        /// True when these came from a receive (destructive or locking)
+        /// rather than a peek.
+        received: bool,
+        result: Result<Vec<SiftMessage>, BackendError>,
+    },
+    Settled {
+        req: RequestId,
+        source: MessageSource,
+        lock_token: String,
+        disposition: Disposition,
+        result: Result<(), BackendError>,
+    },
+    Sent {
+        req: RequestId,
+        target: EntityPath,
+        count: usize,
+        result: Result<(), BackendError>,
     },
 }
 

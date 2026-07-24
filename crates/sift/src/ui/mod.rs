@@ -2,5 +2,7 @@ pub mod connect_dialog;
 pub mod dialogs;
 pub mod entity_view;
 pub mod log_panel;
+pub mod messages_view;
+pub mod send_dialog;
 pub mod tabs;
 pub mod tree_panel;

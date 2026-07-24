@@ -1,0 +1,415 @@
+//! Message browsing surface: toolbar, virtualized message grid, and the
+//! body/properties viewer for the selected message.
+
+use egui_extras::{Column, TableBuilder};
+use sift_backend::{Disposition, MessageSource, ReceiveMode};
+use sift_core::body::{BodyFormat, hex_dump};
+use sift_core::message::SiftMessage;
+
+use crate::state::{AppAction, MessagesView};
+
+pub fn show(
+    ui: &mut egui::Ui,
+    source: &MessageSource,
+    view: &mut MessagesView,
+    actions: &mut Vec<AppAction>,
+) {
+    toolbar(ui, source, view, actions);
+    if let Some(error) = &view.error {
+        ui.colored_label(ui.visuals().error_fg_color, error);
+    }
+    ui.separator();
+
+    // Split the remaining space: grid on top, viewer below.
+    let viewer_height = if view.selected.is_some() {
+        ui.available_height() * 0.5
+    } else {
+        0.0
+    };
+    let grid_height = (ui.available_height() - viewer_height).max(120.0);
+
+    ui.scope(|ui| {
+        ui.set_max_height(grid_height);
+        message_table(ui, view, grid_height);
+    });
+
+    if view.selected.is_some() {
+        ui.separator();
+        message_viewer(ui, view);
+    }
+}
+
+#[allow(clippy::too_many_lines)] // toolbar with settle actions reads best inline
+fn toolbar(
+    ui: &mut egui::Ui,
+    source: &MessageSource,
+    view: &mut MessagesView,
+    actions: &mut Vec<AppAction>,
+) {
+    ui.horizontal_wrapped(|ui| {
+        if view.loading {
+            ui.spinner();
+        } else if ui
+            .button(format!("{} Peek", egui_phosphor::regular::MAGNIFYING_GLASS))
+            .on_hover_text("Browse without consuming, from the front")
+            .clicked()
+        {
+            actions.push(AppAction::PeekMessages {
+                source: source.clone(),
+                from_seq: None,
+                count: view.fetch_count,
+            });
+        }
+        if !view.loading
+            && !view.rows.is_empty()
+            && ui
+                .button("Load more")
+                .on_hover_text("Peek the next page")
+                .clicked()
+        {
+            actions.push(AppAction::PeekMessages {
+                source: source.clone(),
+                from_seq: view.next_seq(),
+                count: view.fetch_count,
+            });
+        }
+        ui.add(
+            egui::DragValue::new(&mut view.fetch_count)
+                .range(1..=1000)
+                .prefix("count: "),
+        );
+
+        ui.menu_button(
+            format!("{} Receive", egui_phosphor::regular::DOWNLOAD_SIMPLE),
+            |ui| {
+                if ui.button("Receive with lock (settle afterwards)").clicked() {
+                    actions.push(AppAction::ReceiveMessages {
+                        source: source.clone(),
+                        mode: ReceiveMode::PeekLock,
+                        count: view.fetch_count,
+                    });
+                    ui.close();
+                }
+                let destructive = egui::RichText::new("Receive and delete (destructive)")
+                    .color(ui.visuals().error_fg_color);
+                if ui.button(destructive).clicked() {
+                    actions.push(AppAction::ReceiveMessages {
+                        source: source.clone(),
+                        mode: ReceiveMode::ReceiveAndDelete,
+                        count: view.fetch_count,
+                    });
+                    ui.close();
+                }
+            },
+        );
+
+        // Settlement actions for the selected locked message.
+        let lock_token = view.selected_message().and_then(|m| m.lock_token.clone());
+        if let Some(token) = lock_token {
+            ui.separator();
+            let settle = |disposition: Disposition| AppAction::Settle {
+                source: source.clone(),
+                lock_token: token.clone(),
+                disposition,
+            };
+            if ui
+                .button("Complete")
+                .on_hover_text("Remove the message")
+                .clicked()
+            {
+                actions.push(settle(Disposition::Complete));
+            }
+            if ui
+                .button("Abandon")
+                .on_hover_text("Release the lock; the message stays")
+                .clicked()
+            {
+                actions.push(settle(Disposition::Abandon));
+            }
+            if ui.button("Defer").clicked() {
+                actions.push(settle(Disposition::Defer));
+            }
+            if !source.dead_letter && ui.button("Dead-letter").clicked() {
+                actions.push(settle(Disposition::DeadLetter {
+                    reason: Some("sift".into()),
+                    description: None,
+                }));
+            }
+        }
+
+        // Resend the selected message as a new one.
+        if let Some(message) = view.selected_message() {
+            ui.separator();
+            if ui
+                .button(format!(
+                    "{} Resend…",
+                    egui_phosphor::regular::PAPER_PLANE_TILT
+                ))
+                .on_hover_text("Compose a new message from this one")
+                .clicked()
+            {
+                let target = send_target(source);
+                actions.push(AppAction::OpenSendDialog {
+                    target,
+                    prefill: Some(Box::new(message.to_outbound())),
+                });
+            }
+        }
+    });
+}
+
+/// Where a resend from this source should go: queues to themselves,
+/// subscriptions (and their DLQs) back to the topic.
+fn send_target(source: &MessageSource) -> sift_backend::EntityPath {
+    match &source.entity {
+        sift_backend::EntityPath::Subscription { topic, .. } => {
+            sift_backend::EntityPath::Topic(topic.clone())
+        }
+        other => other.clone(),
+    }
+}
+
+fn message_table(ui: &mut egui::Ui, view: &mut MessagesView, height: f32) {
+    let dlq_column = view.rows.iter().any(|m| m.dead_letter_reason.is_some());
+    let mut builder = TableBuilder::new(ui)
+        .striped(true)
+        .resizable(true)
+        .sense(egui::Sense::click())
+        .max_scroll_height(height)
+        .column(Column::auto().at_least(56.0)) // seq
+        .column(Column::auto().at_least(64.0)) // state / lock
+        .column(Column::remainder().at_least(120.0)) // message id
+        .column(Column::remainder().at_least(100.0)) // subject
+        .column(Column::auto().at_least(130.0)) // enqueued
+        .column(Column::auto().at_least(52.0)) // size
+        .column(Column::auto().at_least(28.0)); // deliveries
+    if dlq_column {
+        builder = builder.column(Column::remainder().at_least(100.0));
+    }
+
+    builder
+        .header(20.0, |mut header| {
+            for title in [
+                "Seq",
+                "State",
+                "Message id",
+                "Subject",
+                "Enqueued (UTC)",
+                "Size",
+                "×",
+            ] {
+                header.col(|ui| {
+                    ui.label(egui::RichText::new(title).strong());
+                });
+            }
+            if dlq_column {
+                header.col(|ui| {
+                    ui.label(egui::RichText::new("DLQ reason").strong());
+                });
+            }
+        })
+        .body(|body| {
+            body.rows(18.0, view.rows.len(), |mut row| {
+                let index = row.index();
+                let message = &view.rows[index];
+                row.set_selected(view.selected == Some(index));
+
+                row.col(|ui| {
+                    ui.monospace(message.sequence_number.to_string());
+                });
+                row.col(|ui| {
+                    let text = if message.lock_token.is_some() {
+                        egui::RichText::new("locked").color(ui.visuals().warn_fg_color)
+                    } else {
+                        egui::RichText::new(message.state.label()).weak()
+                    };
+                    ui.label(text);
+                });
+                row.col(|ui| {
+                    ui.monospace(message.message_id.as_deref().unwrap_or("—"));
+                });
+                row.col(|ui| {
+                    ui.label(message.subject.as_deref().unwrap_or("—"));
+                });
+                row.col(|ui| {
+                    ui.monospace(
+                        message
+                            .enqueued_time
+                            .map_or_else(|| "—".into(), format_time),
+                    );
+                });
+                row.col(|ui| {
+                    ui.monospace(format_size(message.body.size()));
+                });
+                row.col(|ui| {
+                    ui.monospace(message.delivery_count.map_or("—".into(), |c| c.to_string()));
+                });
+                if dlq_column {
+                    row.col(|ui| {
+                        ui.label(message.dead_letter_reason.as_deref().unwrap_or("—"));
+                    });
+                }
+
+                if row.response().clicked() {
+                    view.selected = if view.selected == Some(index) {
+                        None
+                    } else {
+                        Some(index)
+                    };
+                }
+            });
+        });
+
+    if view.rows.is_empty() && !view.loading {
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("No messages loaded — use Peek.").weak());
+    }
+}
+
+fn message_viewer(ui: &mut egui::Ui, view: &mut MessagesView) {
+    let Some(index) = view.selected else { return };
+    let Some(message) = view.rows.get(index) else {
+        view.selected = None;
+        return;
+    };
+    // Clone the light-weight parts we need so the view can stay borrowed mut.
+    let body = message.body.clone();
+    let message = message.clone();
+
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(body.format.label()).strong());
+        if body.gzipped {
+            ui.label(egui::RichText::new("gzip").weak());
+        }
+        ui.label(egui::RichText::new(format_size(body.size())).weak());
+        if let Some(content_type) = &message.content_type {
+            ui.label(egui::RichText::new(content_type).weak());
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // One-click copy of the (decoded) body.
+            if ui
+                .button(format!("{} Copy body", egui_phosphor::regular::COPY))
+                .clicked()
+            {
+                let text = body
+                    .text
+                    .clone()
+                    .unwrap_or_else(|| hex_dump(&body.bytes, usize::MAX));
+                ui.ctx().copy_text(text);
+            }
+            ui.checkbox(&mut view.show_hex, "Hex");
+        });
+    });
+
+    egui::ScrollArea::vertical()
+        .id_salt("message-viewer")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            if view.show_hex || body.text.is_none() {
+                ui.monospace(hex_dump(&body.bytes, 16 * 1024));
+            } else if let Some(text) = &body.text {
+                let language = match body.format {
+                    BodyFormat::Json => "json",
+                    BodyFormat::Xml => "xml",
+                    _ => "txt",
+                };
+                let theme = egui_extras::syntax_highlighting::CodeTheme::from_style(ui.style());
+                egui_extras::syntax_highlighting::code_view_ui(ui, &theme, text, language);
+            }
+
+            ui.add_space(8.0);
+            egui::CollapsingHeader::new("System properties")
+                .default_open(false)
+                .show(ui, |ui| system_properties(ui, &message));
+            if !message.application_properties.is_empty() {
+                egui::CollapsingHeader::new(format!(
+                    "Custom properties ({})",
+                    message.application_properties.len()
+                ))
+                .default_open(true)
+                .show(ui, |ui| {
+                    egui::Grid::new("custom-props")
+                        .num_columns(2)
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for (key, value) in &message.application_properties {
+                                ui.label(egui::RichText::new(key).weak());
+                                ui.monospace(value);
+                                ui.end_row();
+                            }
+                        });
+                });
+            }
+        });
+}
+
+fn system_properties(ui: &mut egui::Ui, m: &SiftMessage) {
+    egui::Grid::new("system-props")
+        .num_columns(2)
+        .striped(true)
+        .show(ui, |ui| {
+            let mut row = |label: &str, value: String| {
+                ui.label(egui::RichText::new(label).weak());
+                ui.monospace(value);
+                ui.end_row();
+            };
+            row("Sequence number", m.sequence_number.to_string());
+            row("Message id", m.message_id.clone().unwrap_or_default());
+            row("Subject", m.subject.clone().unwrap_or_default());
+            row(
+                "Correlation id",
+                m.correlation_id.clone().unwrap_or_default(),
+            );
+            row("Session id", m.session_id.clone().unwrap_or_default());
+            row("To", m.to.clone().unwrap_or_default());
+            row("Reply to", m.reply_to.clone().unwrap_or_default());
+            row(
+                "Enqueued",
+                m.enqueued_time.map(format_time).unwrap_or_default(),
+            );
+            row("Expires", m.expires_at.map(format_time).unwrap_or_default());
+            row(
+                "Delivery count",
+                m.delivery_count.map(|c| c.to_string()).unwrap_or_default(),
+            );
+            row("State", m.state.label().to_owned());
+            if let Some(token) = &m.lock_token {
+                row("Lock token", token.clone());
+            }
+            if let Some(until) = m.locked_until {
+                row("Locked until", format_time(until));
+            }
+            if let Some(reason) = &m.dead_letter_reason {
+                row("DLQ reason", reason.clone());
+            }
+            if let Some(desc) = &m.dead_letter_error_description {
+                row("DLQ description", desc.clone());
+            }
+            if let Some(source) = &m.dead_letter_source {
+                row("DLQ source", source.clone());
+            }
+        });
+}
+
+fn format_time(t: time::OffsetDateTime) -> String {
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        t.year(),
+        u8::from(t.month()),
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second()
+    )
+}
+
+#[allow(clippy::cast_precision_loss)] // display only; message sizes never approach 2^52 bytes
+fn format_size(bytes: usize) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}

@@ -7,9 +7,10 @@
 
 pub mod backend;
 pub mod bridge;
+mod sb_runtime;
 
 pub use backend::{RepaintFn, spawn};
 pub use bridge::{
-    BackendError, BackendHandle, Command, EntityDescription, EntityInfo, EntityPath, Event,
-    MutationOp, NamespaceId, RequestId,
+    BackendError, BackendHandle, Command, Disposition, EntityDescription, EntityInfo, EntityPath,
+    Event, MessageSource, MutationOp, NamespaceId, ReceiveMode, RequestId,
 };

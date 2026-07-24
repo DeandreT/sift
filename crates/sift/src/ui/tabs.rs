@@ -3,10 +3,10 @@
 
 use std::collections::HashMap;
 
-use sift_backend::{EntityInfo, EntityPath};
+use sift_backend::{EntityPath, MessageSource};
 
-use crate::state::{AppAction, ConnectionState, Loadable};
-use crate::ui::entity_view;
+use crate::state::{AppAction, ConnectionState, EntityPage, EntityTabState, Loadable};
+use crate::ui::{entity_view, messages_view};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum TabId {
@@ -17,7 +17,8 @@ pub enum TabId {
 /// Borrowed view of app state handed to the dock each frame.
 pub struct TabViewerCtx<'a> {
     pub conn: &'a ConnectionState,
-    pub entities: &'a HashMap<EntityPath, Loadable<EntityInfo>>,
+    pub entities: &'a mut HashMap<EntityPath, EntityTabState>,
+    pub peek_batch: u32,
     pub actions: &'a mut Vec<AppAction>,
 }
 
@@ -83,26 +84,79 @@ impl TabViewerCtx<'_> {
             ui.label(egui::RichText::new("Not connected.").weak());
             return;
         }
-        match self.entities.get(path) {
-            None | Some(Loadable::NotLoaded) => {
-                self.actions.push(AppAction::RefreshEntity(path.clone()));
+        let state = self
+            .entities
+            .entry(path.clone())
+            .or_insert_with(|| EntityTabState::new(self.peek_batch));
+
+        // Queues and subscriptions get message-browsing pages.
+        if matches!(path, EntityPath::Queue(_) | EntityPath::Subscription { .. }) {
+            let dlq_count = match &state.info {
+                Loadable::Loaded(sift_backend::EntityInfo::Queue(q)) => {
+                    Some(q.runtime.count_details.dead_letter)
+                }
+                Loadable::Loaded(sift_backend::EntityInfo::Subscription(s)) => {
+                    Some(s.runtime.count_details.dead_letter)
+                }
+                _ => None,
+            };
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut state.page, EntityPage::Overview, "Overview");
+                ui.selectable_value(&mut state.page, EntityPage::Messages, "Messages");
+                let dlq_label = dlq_count.map_or_else(
+                    || "Dead-letter".to_owned(),
+                    |n| format!("Dead-letter ({n})"),
+                );
+                ui.selectable_value(&mut state.page, EntityPage::DeadLetter, dlq_label);
+            });
+            ui.separator();
+        }
+
+        match state.page {
+            EntityPage::Overview => Self::overview(ui, path, state, self.actions),
+            EntityPage::Messages => {
+                let source = MessageSource {
+                    entity: path.clone(),
+                    dead_letter: false,
+                };
+                messages_view::show(ui, &source, &mut state.main, self.actions);
             }
-            Some(Loadable::Loading) => {
+            EntityPage::DeadLetter => {
+                let source = MessageSource {
+                    entity: path.clone(),
+                    dead_letter: true,
+                };
+                messages_view::show(ui, &source, &mut state.dead_letter, self.actions);
+            }
+        }
+    }
+
+    fn overview(
+        ui: &mut egui::Ui,
+        path: &EntityPath,
+        state: &EntityTabState,
+        actions: &mut Vec<AppAction>,
+    ) {
+        match &state.info {
+            Loadable::NotLoaded => {
+                actions.push(AppAction::RefreshEntity(path.clone()));
+            }
+            Loadable::Loading => {
                 ui.add_space(24.0);
                 ui.vertical_centered(|ui| {
                     ui.spinner();
                     ui.label(format!("Loading {}…", path.name()));
                 });
             }
-            Some(Loadable::Failed(error)) => {
+            Loadable::Failed(error) => {
                 ui.add_space(16.0);
                 ui.colored_label(ui.visuals().error_fg_color, error);
                 if ui.button("Retry").clicked() {
-                    self.actions.push(AppAction::RefreshEntity(path.clone()));
+                    actions.push(AppAction::RefreshEntity(path.clone()));
                 }
             }
-            Some(Loadable::Loaded(info)) => {
-                entity_view::show(ui, info, self.actions);
+            Loadable::Loaded(info) => {
+                entity_view::show(ui, info, actions);
             }
         }
     }

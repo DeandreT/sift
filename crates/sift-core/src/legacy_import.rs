@@ -1,10 +1,9 @@
-//! Import saved namespaces from the classic legacy explorer tool.
+//! Import saved namespaces from a legacy .NET explorer-tool config file.
 //!
-//! The .NET app stores connection strings (in plaintext) in a
-//! `serviceBusNamespaces` dictionary section, either in
-//! `legacy tool.exe.config` next to the executable or in the per-user
-//! `%APPDATA%\legacy explorer tool\UserSettings.config`. Importing moves the
-//! key material into the OS secret store and creates a sift profile per entry.
+//! Older tools store connection strings (in plaintext) in a
+//! `serviceBusNamespaces` dictionary section of an XML `.config` file.
+//! Importing moves the key material into the OS secret store and creates a
+//! sift profile per entry.
 
 use std::path::{Path, PathBuf};
 
@@ -23,7 +22,7 @@ pub enum LegacyImportError {
         #[source]
         source: std::io::Error,
     },
-    #[error("{path} is not a valid legacy explorer tool config: {detail}")]
+    #[error("{path} is not a valid namespaces config: {detail}")]
     Parse { path: PathBuf, detail: String },
     #[error("no <serviceBusNamespaces> entries found in {path}")]
     NoNamespaces { path: PathBuf },
@@ -54,16 +53,6 @@ impl std::fmt::Display for ImportReport {
     }
 }
 
-/// Default location of the per-user legacy explorer tool config on Windows.
-#[must_use]
-pub fn default_user_config_path() -> Option<PathBuf> {
-    let appdata = std::env::var_os("APPDATA")?;
-    let path = Path::new(&appdata)
-        .join("legacy explorer tool")
-        .join("UserSettings.config");
-    path.exists().then_some(path)
-}
-
 /// Read `path` and import every `serviceBusNamespaces` entry into `config`
 /// and `secrets`. Idempotent: entries whose name already exists as a profile
 /// have their secret and endpoint refreshed instead of being duplicated.
@@ -90,7 +79,7 @@ pub fn import_from_file(
 
 /// Extract `(name, connection string)` pairs from the
 /// `<serviceBusNamespaces><add key="…" value="…"/></serviceBusNamespaces>`
-/// section of a legacy explorer tool config file.
+/// section of a .NET-style config file.
 pub fn parse_legacy_config(xml: &str) -> Result<Vec<(String, SecretString)>, String> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);

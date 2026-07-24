@@ -1,11 +1,10 @@
-//! Service Bus connection-string parsing.
-//!
-//! Ports the semantics of the reference app's `ServiceBusNamespace.cs`:
-//! parameters split on `;`, keys matched case-insensitively, values taken
-//! verbatim after the *first* `=` (keys are base64 and contain `=` padding),
-//! and endpoints without a scheme prefixed with `sb://`. The legacy
-//! on-premises "Service Bus for Windows Server" parameters are recognized but
-//! rejected with a warning rather than supported.
+//! Service Bus connection-string parsing, matching the tolerances of the
+//! classic .NET clients: parameters split on `;`, keys matched
+//! case-insensitively, values taken verbatim after the *first* `=` (keys are
+//! base64 and contain `=` padding), and endpoints without a scheme prefixed
+//! with `sb://`. The legacy on-premises "Service Bus for Windows Server"
+//! parameters are recognized but rejected with a warning rather than
+//! supported.
 
 use url::Url;
 
@@ -109,9 +108,9 @@ impl NamespaceConnection {
                     transport = match value.to_ascii_lowercase().as_str() {
                         "amqp" => TransportType::AmqpTcp,
                         "amqpwebsockets" => TransportType::AmqpWebSockets,
-                        // Match the reference app's Enum.TryParse leniency:
-                        // legacy (NetMessaging) or unknown transports fall back
-                        // to AMQP with a warning instead of failing the parse.
+                        // Match the classic .NET clients' Enum.TryParse
+                        // leniency: legacy (NetMessaging) or unknown transports
+                        // fall back to AMQP with a warning instead of failing.
                         other => {
                             warnings.push(format!(
                                 "transport type '{other}' is not supported; using AMQP"
@@ -136,7 +135,7 @@ impl NamespaceConnection {
         }
 
         let endpoint_raw = endpoint_raw.ok_or(ConnectionStringError::MissingEndpoint)?;
-        // Match the reference app: endpoints without a scheme get "sb://".
+        // Endpoints without a scheme get "sb://", like the .NET clients.
         let endpoint_raw = if endpoint_raw.contains("://") {
             endpoint_raw
         } else {

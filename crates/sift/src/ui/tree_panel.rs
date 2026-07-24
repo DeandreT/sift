@@ -320,8 +320,7 @@ fn rule_row(ui: &mut egui::Ui, rule: &RuleInfo, actions: &mut Vec<AppAction>) {
 
 // ---- shared helpers -------------------------------------------------------------
 
-/// `name (active, dead-letter, scheduled)`, tinted when the DLQ is non-empty
-/// (parity with the reference app's node coloring).
+/// `name (active, dead-letter, scheduled)`, tinted when the DLQ is non-empty.
 fn entity_label(
     ui: &egui::Ui,
     icon: &str,
