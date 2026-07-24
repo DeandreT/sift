@@ -242,6 +242,13 @@ fn send_target(source: &MessageSource) -> sift_backend::EntityPath {
     }
 }
 
+/// A single-line, truncated table cell so every row stays one line tall and
+/// the selection highlight matches the row. Returns the response for hover
+/// tooltips on columns that may be clipped.
+fn cell(ui: &mut egui::Ui, text: egui::RichText) -> egui::Response {
+    ui.add(egui::Label::new(text).truncate().selectable(false))
+}
+
 fn message_table(ui: &mut egui::Ui, view: &mut MessagesView, height: f32) {
     let dlq_column = view.rows.iter().any(|m| m.dead_letter_reason.is_some());
     let mut builder = TableBuilder::new(ui)
@@ -288,7 +295,10 @@ fn message_table(ui: &mut egui::Ui, view: &mut MessagesView, height: f32) {
                 row.set_selected(view.selected == Some(index));
 
                 row.col(|ui| {
-                    ui.monospace(message.sequence_number.to_string());
+                    cell(
+                        ui,
+                        egui::RichText::new(message.sequence_number.to_string()).monospace(),
+                    );
                 });
                 row.col(|ui| {
                     let text = if message.lock_token.is_some() {
@@ -296,30 +306,41 @@ fn message_table(ui: &mut egui::Ui, view: &mut MessagesView, height: f32) {
                     } else {
                         egui::RichText::new(message.state.label()).weak()
                     };
-                    ui.label(text);
+                    cell(ui, text);
                 });
                 row.col(|ui| {
-                    ui.monospace(message.message_id.as_deref().unwrap_or("—"));
+                    let id = message.message_id.as_deref().unwrap_or("—");
+                    cell(ui, egui::RichText::new(id).monospace()).on_hover_text(id);
                 });
                 row.col(|ui| {
-                    ui.label(message.subject.as_deref().unwrap_or("—"));
+                    let subject = message.subject.as_deref().unwrap_or("—");
+                    cell(ui, egui::RichText::new(subject)).on_hover_text(subject);
                 });
                 row.col(|ui| {
-                    ui.monospace(
-                        message
-                            .enqueued_time
-                            .map_or_else(|| "—".into(), format_time),
+                    let text = message
+                        .enqueued_time
+                        .map_or_else(|| "—".into(), format_time);
+                    cell(ui, egui::RichText::new(text).monospace());
+                });
+                row.col(|ui| {
+                    cell(
+                        ui,
+                        egui::RichText::new(format_size(message.body.size())).monospace(),
                     );
                 });
                 row.col(|ui| {
-                    ui.monospace(format_size(message.body.size()));
-                });
-                row.col(|ui| {
-                    ui.monospace(message.delivery_count.map_or("—".into(), |c| c.to_string()));
+                    let count = message
+                        .delivery_count
+                        .map_or_else(|| "—".into(), |c| c.to_string());
+                    cell(ui, egui::RichText::new(count).monospace());
                 });
                 if dlq_column {
                     row.col(|ui| {
-                        ui.label(message.dead_letter_reason.as_deref().unwrap_or("—"));
+                        let reason = message.dead_letter_reason.as_deref().unwrap_or("—");
+                        // Full reason (often a multi-line stack trace) is in the
+                        // detail pane; keep the grid row single-line.
+                        cell(ui, egui::RichText::new(reason.replace('\n', " ")))
+                            .on_hover_text(reason);
                     });
                 }
 
