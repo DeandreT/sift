@@ -97,6 +97,19 @@ pub fn decode_base64(text: &str) -> Result<DecodedBody, String> {
     Err("not valid base64".to_owned())
 }
 
+/// Detect whether `text` is plausibly a base64-wrapped payload and return the
+/// decoded body if so. Stricter than [`decode_base64`]: short strings and
+/// decodes that yield binary noise are rejected, so ordinary words that
+/// happen to be valid base64 don't count.
+#[must_use]
+pub fn detect_base64(text: &str) -> Option<DecodedBody> {
+    let trimmed: String = text.split_whitespace().collect();
+    if trimmed.len() < 8 {
+        return None;
+    }
+    decode_base64(&trimmed).ok().filter(|d| d.text.is_some())
+}
+
 /// Decode raw `Data`-section bytes.
 #[must_use]
 pub fn decode(bytes: Vec<u8>) -> DecodedBody {
@@ -272,6 +285,18 @@ mod tests {
         assert!(decode_base64("eyJhIjox\n  fQ==").is_ok());
         assert!(decode_base64("not base64!!!").is_err());
         assert!(decode_base64("   ").is_err());
+    }
+
+    #[test]
+    fn detect_base64_finds_wrapped_payloads_only() {
+        // base64 of {"a":1} — a real wrapped payload.
+        assert!(detect_base64("eyJhIjoxfQ==").is_some());
+        // Ordinary text is not flagged.
+        assert!(detect_base64("plain text body").is_none());
+        // Too short, even though 'test' is valid base64.
+        assert!(detect_base64("test").is_none());
+        // Valid base64 that decodes to binary noise is not flagged.
+        assert!(detect_base64("ABCDEFGHIJKL").is_none());
     }
 
     #[test]

@@ -364,24 +364,15 @@ fn message_viewer(ui: &mut egui::Ui, view: &mut MessagesView) {
     let raw_body = message.body.clone();
     let message = message.clone();
 
-    // Optionally reinterpret the body as base64; fall back with a note.
-    let base64_error = if view.show_base64 {
-        raw_body
-            .text
-            .as_deref()
-            .map(sift_core::body::decode_base64)
-            .and_then(Result::err)
-    } else {
-        None
-    };
-    let body = if view.show_base64 {
-        raw_body
-            .text
-            .as_deref()
-            .and_then(|t| sift_core::body::decode_base64(t).ok())
-            .unwrap_or_else(|| raw_body.clone())
-    } else {
-        raw_body.clone()
+    // Offer base64 decoding only when the body actually looks like a
+    // base64-wrapped payload.
+    let base64_decoded = raw_body
+        .text
+        .as_deref()
+        .and_then(sift_core::body::detect_base64);
+    let body = match (&base64_decoded, view.show_base64) {
+        (Some(decoded), true) => decoded.clone(),
+        _ => raw_body.clone(),
     };
 
     ui.horizontal(|ui| {
@@ -406,13 +397,12 @@ fn message_viewer(ui: &mut egui::Ui, view: &mut MessagesView) {
                 ui.ctx().copy_text(text);
             }
             ui.checkbox(&mut view.show_hex, "Hex");
-            ui.checkbox(&mut view.show_base64, "Base64")
-                .on_hover_text("Interpret the body as base64 and decode it");
+            if base64_decoded.is_some() {
+                ui.checkbox(&mut view.show_base64, "Base64")
+                    .on_hover_text("This body looks like base64 — show the decoded content");
+            }
         });
     });
-    if let Some(err) = base64_error {
-        ui.colored_label(ui.visuals().warn_fg_color, format!("Base64: {err}"));
-    }
 
     // Body on the left, properties on the right (resizable split).
     egui::Panel::right("message-props")
