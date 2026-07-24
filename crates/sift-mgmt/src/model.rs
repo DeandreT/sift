@@ -114,7 +114,7 @@ pub fn parse_iso8601(s: &str) -> Option<Duration> {
 }
 
 /// Entity status, matching the service's `EntityStatus` values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum EntityStatus {
     #[default]
     Active,
@@ -189,7 +189,8 @@ pub struct EntityRuntimeInfo {
 // ---------------------------------------------------------------------------
 // Queue
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct QueueProperties {
     pub name: String,
     pub lock_duration: Duration,
@@ -245,7 +246,8 @@ pub struct QueueInfo {
 // ---------------------------------------------------------------------------
 // Topic
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct TopicProperties {
     pub name: String,
     pub default_message_time_to_live: Duration,
@@ -296,7 +298,8 @@ pub struct TopicInfo {
 // ---------------------------------------------------------------------------
 // Subscription
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct SubscriptionProperties {
     /// Parent topic path.
     pub topic: String,
@@ -345,7 +348,7 @@ pub struct SubscriptionInfo {
 // ---------------------------------------------------------------------------
 // Rule
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RuleFilter {
     Sql {
         expression: String,
@@ -377,7 +380,7 @@ impl RuleFilter {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RuleProperties {
     pub topic: String,
     pub subscription: String,

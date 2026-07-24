@@ -280,11 +280,16 @@ async fn run(mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Command>, sink: Ev
                 tokio::spawn(async move {
                     let count = messages.len();
                     let result = match runtime_for(&state, ns).await {
-                        Ok(rt) => rt.lock().await.send(&target, messages).await.map(|_| ()),
+                        Ok(rt) => rt
+                            .lock()
+                            .await
+                            .send(&target, messages)
+                            .await
+                            .map(|_| Vec::new()),
                         Err(e) => Err(e),
                     };
                     match &result {
-                        Ok(()) => tracing::info!("sent {count} message(s) to '{target}'"),
+                        Ok(_) => tracing::info!("sent {count} message(s) to '{target}'"),
                         Err(e) => tracing::error!("send to '{target}' failed: {e}"),
                     }
                     sink.send(Event::Sent {
@@ -293,6 +298,113 @@ async fn run(mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Command>, sink: Ev
                         count,
                         result,
                     });
+                });
+            }
+            Command::ScheduleMessages {
+                req,
+                ns,
+                target,
+                messages,
+                enqueue_at,
+            } => {
+                let (sink, state) = (sink.clone(), Arc::clone(&state));
+                tokio::spawn(async move {
+                    let count = messages.len();
+                    let result = match runtime_for(&state, ns).await {
+                        Ok(rt) => {
+                            rt.lock()
+                                .await
+                                .schedule(&target, messages, enqueue_at)
+                                .await
+                        }
+                        Err(e) => Err(e),
+                    };
+                    match &result {
+                        Ok(seqs) => {
+                            tracing::info!("scheduled {} message(s) on '{target}'", seqs.len());
+                        }
+                        Err(e) => tracing::error!("schedule on '{target}' failed: {e}"),
+                    }
+                    sink.send(Event::Sent {
+                        req,
+                        target,
+                        count,
+                        result,
+                    });
+                });
+            }
+            Command::CancelScheduled {
+                req,
+                ns,
+                target,
+                sequence_number,
+            } => {
+                let (sink, state) = (sink.clone(), Arc::clone(&state));
+                tokio::spawn(async move {
+                    let result = match runtime_for(&state, ns).await {
+                        Ok(rt) => {
+                            rt.lock()
+                                .await
+                                .cancel_scheduled(&target, sequence_number)
+                                .await
+                        }
+                        Err(e) => Err(e),
+                    };
+                    if let Err(e) = &result {
+                        tracing::error!("cancel scheduled on '{target}' failed: {e}");
+                    }
+                    sink.send(Event::ScheduledCancelled {
+                        req,
+                        target,
+                        sequence_number,
+                        result,
+                    });
+                });
+            }
+            Command::ReceiveDeferred {
+                req,
+                ns,
+                source,
+                sequence_numbers,
+            } => {
+                let (sink, state) = (sink.clone(), Arc::clone(&state));
+                tokio::spawn(async move {
+                    let result = match runtime_for(&state, ns).await {
+                        Ok(rt) => {
+                            rt.lock()
+                                .await
+                                .receive_deferred(&source, sequence_numbers)
+                                .await
+                        }
+                        Err(e) => Err(e),
+                    };
+                    if let Err(e) = &result {
+                        tracing::error!("receive deferred from '{source}' failed: {e}");
+                    }
+                    sink.send(Event::Messages {
+                        req,
+                        source,
+                        from_seq: None,
+                        received: true,
+                        result,
+                    });
+                });
+            }
+            Command::ExportNamespace { req, ns, path } => {
+                spawn_op(&sink, &state, ns, move |client, sink| async move {
+                    let result = export_namespace(&client, &path).await;
+                    sink.send(Event::NamespaceTransfer { req, result });
+                });
+            }
+            Command::ImportNamespace {
+                req,
+                ns,
+                path,
+                overwrite,
+            } => {
+                spawn_op(&sink, &state, ns, move |client, sink| async move {
+                    let result = import_namespace(&client, &path, overwrite).await;
+                    sink.send(Event::NamespaceTransfer { req, result });
                 });
             }
             Command::StartPurge { op, ns, source } => {
@@ -599,6 +711,49 @@ async fn delete_entity(client: &ManagementClient, path: &EntityPath) -> Result<(
         } => client.delete_rule(topic, subscription, name).await?,
     }
     Ok(())
+}
+
+async fn export_namespace(
+    client: &ManagementClient,
+    path: &std::path::Path,
+) -> Result<String, BackendError> {
+    let export = sift_mgmt::transfer::export(client).await?;
+    let json = serde_json::to_string_pretty(&export)
+        .map_err(|e| BackendError::new(format!("could not serialize export: {e}")))?;
+    tokio::fs::write(path, json)
+        .await
+        .map_err(|e| BackendError::new(format!("could not write {}: {e}", path.display())))?;
+    Ok(format!(
+        "exported {} entities to {}",
+        export.entity_count(),
+        path.display()
+    ))
+}
+
+async fn import_namespace(
+    client: &ManagementClient,
+    path: &std::path::Path,
+    overwrite: bool,
+) -> Result<String, BackendError> {
+    let json = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| BackendError::new(format!("could not read {}: {e}", path.display())))?;
+    let export: sift_mgmt::NamespaceExport = serde_json::from_str(&json).map_err(|e| {
+        BackendError::new(format!(
+            "{} is not a valid sift export: {e}",
+            path.display()
+        ))
+    })?;
+    let policy = if overwrite {
+        sift_mgmt::ImportPolicy::Overwrite
+    } else {
+        sift_mgmt::ImportPolicy::Skip
+    };
+    let outcome = sift_mgmt::transfer::import(client, &export, policy).await;
+    for error in &outcome.errors {
+        tracing::warn!("import: {error}");
+    }
+    Ok(format!("import finished: {outcome}"))
 }
 
 async fn connect(

@@ -323,7 +323,7 @@ fn live_purge_and_resubmit() {
         });
         recv_until(&events, |e| match e {
             Event::Sent { result, .. } => {
-                let _: () = result.expect("send");
+                result.expect("send");
                 Some(())
             }
             _ => None,
@@ -419,4 +419,204 @@ fn live_purge_and_resubmit() {
     rt.block_on(mgmt.delete_queue(&queue_name))
         .expect("delete scratch queue");
     eprintln!("purge + resubmit OK on '{queue_name}'");
+}
+
+#[allow(clippy::too_many_lines)] // a linear end-to-end scenario reads best in one function
+#[test]
+fn live_scheduled_deferred_export() {
+    let Ok(connection_string) = std::env::var("SIFT_TEST_SB_CONNECTION_STRING") else {
+        eprintln!("skipped: SIFT_TEST_SB_CONNECTION_STRING not set");
+        return;
+    };
+    if std::env::var("SIFT_TEST_SB_MUTATE").as_deref() != Ok("1") {
+        eprintln!("skipped: SIFT_TEST_SB_MUTATE != 1");
+        return;
+    }
+
+    let conn = NamespaceConnection::parse(&connection_string).expect("valid connection string");
+    let mgmt = ManagementClient::new(&conn).expect("management client");
+    let queue_name = format!("sift-test-sd-{}", uuid::Uuid::new_v4());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime for mgmt calls");
+    rt.block_on(mgmt.create_queue(&QueueProperties {
+        name: queue_name.clone(),
+        ..QueueProperties::default()
+    }))
+    .expect("create scratch queue");
+
+    let (backend, events) = sift_backend::spawn(Arc::new(|| {}));
+    let profile = NamespaceProfile::new_connection_string("live-sd-test".into());
+    let ns = profile.id;
+    backend.send(Command::Connect {
+        req: backend.next_request(),
+        profile,
+        secret: SecretString::from(connection_string.as_str()),
+    });
+    recv_until(&events, |e| match e {
+        Event::Connected { result, .. } => Some(result.expect("connect")),
+        _ => None,
+    });
+
+    let queue_path = EntityPath::Queue(queue_name.clone());
+    let source = MessageSource {
+        entity: queue_path.clone(),
+        dead_letter: false,
+    };
+
+    // Schedule a message an hour out; it should come back as a sequence number.
+    backend.send(Command::ScheduleMessages {
+        req: backend.next_request(),
+        ns,
+        target: queue_path.clone(),
+        messages: vec![OutboundMessage {
+            body: "scheduled".into(),
+            ..OutboundMessage::default()
+        }],
+        enqueue_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+    });
+    let seqs = recv_until(&events, |e| match e {
+        Event::Sent { result, .. } => Some(result.expect("schedule")),
+        _ => None,
+    });
+    assert_eq!(seqs.len(), 1);
+
+    // Peek sees it in the scheduled state.
+    backend.send(Command::PeekMessages {
+        req: backend.next_request(),
+        ns,
+        source: source.clone(),
+        from_seq: None,
+        count: 10,
+    });
+    let scheduled = recv_until(&events, |e| match e {
+        Event::Messages {
+            received: false,
+            result,
+            ..
+        } => Some(result.expect("peek scheduled")),
+        _ => None,
+    });
+    assert!(
+        scheduled
+            .iter()
+            .any(|m| m.state == sift_core::message::MessageState::Scheduled)
+    );
+
+    // Cancel it by sequence number.
+    backend.send(Command::CancelScheduled {
+        req: backend.next_request(),
+        ns,
+        target: queue_path.clone(),
+        sequence_number: seqs[0],
+    });
+    recv_until(&events, |e| match e {
+        Event::ScheduledCancelled { result, .. } => {
+            let _: () = result.expect("cancel scheduled");
+            Some(())
+        }
+        _ => None,
+    });
+
+    // Defer round-trip: send, lock, defer, retrieve by sequence number.
+    backend.send(Command::SendMessages {
+        req: backend.next_request(),
+        ns,
+        target: queue_path.clone(),
+        messages: vec![OutboundMessage {
+            body: "deferred".into(),
+            ..OutboundMessage::default()
+        }],
+    });
+    recv_until(&events, |e| match e {
+        Event::Sent { result, .. } => Some(result.expect("send")),
+        _ => None,
+    });
+    backend.send(Command::ReceiveMessages {
+        req: backend.next_request(),
+        ns,
+        source: source.clone(),
+        mode: ReceiveMode::PeekLock,
+        count: 1,
+    });
+    let locked = recv_until(&events, |e| match e {
+        Event::Messages {
+            received: true,
+            result,
+            ..
+        } => Some(result.expect("receive")),
+        _ => None,
+    });
+    let deferred_seq = locked[0].sequence_number;
+    backend.send(Command::SettleMessage {
+        req: backend.next_request(),
+        ns,
+        source: source.clone(),
+        lock_token: locked[0].lock_token.clone().expect("lock token"),
+        disposition: Disposition::Defer,
+    });
+    recv_until(&events, |e| match e {
+        Event::Settled { result, .. } => {
+            let _: () = result.expect("defer");
+            Some(())
+        }
+        _ => None,
+    });
+
+    backend.send(Command::ReceiveDeferred {
+        req: backend.next_request(),
+        ns,
+        source: source.clone(),
+        sequence_numbers: vec![deferred_seq],
+    });
+    let retrieved = recv_until(&events, |e| match e {
+        Event::Messages {
+            received: true,
+            result,
+            ..
+        } => Some(result.expect("receive deferred")),
+        _ => None,
+    });
+    assert_eq!(retrieved.len(), 1);
+    assert_eq!(retrieved[0].sequence_number, deferred_seq);
+    // Complete it so nothing lingers.
+    backend.send(Command::SettleMessage {
+        req: backend.next_request(),
+        ns,
+        source,
+        lock_token: retrieved[0]
+            .lock_token
+            .clone()
+            .expect("deferred lock token"),
+        disposition: Disposition::Complete,
+    });
+    recv_until(&events, |e| match e {
+        Event::Settled { result, .. } => {
+            let _: () = result.expect("complete deferred");
+            Some(())
+        }
+        _ => None,
+    });
+
+    // Export the namespace and confirm the scratch queue is in the file.
+    let export_path =
+        std::env::temp_dir().join(format!("sift-export-{}.json", uuid::Uuid::new_v4()));
+    backend.send(Command::ExportNamespace {
+        req: backend.next_request(),
+        ns,
+        path: export_path.clone(),
+    });
+    recv_until(&events, |e| match e {
+        Event::NamespaceTransfer { result, .. } => Some(result.expect("export")),
+        _ => None,
+    });
+    let exported = std::fs::read_to_string(&export_path).expect("read export file");
+    assert!(exported.contains(&queue_name));
+    let _ = std::fs::remove_file(&export_path);
+
+    backend.send(Command::Disconnect { ns });
+    rt.block_on(mgmt.delete_queue(&queue_name))
+        .expect("delete scratch queue");
+    eprintln!("scheduled + deferred + export OK on '{queue_name}'");
 }

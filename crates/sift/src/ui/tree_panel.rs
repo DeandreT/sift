@@ -290,11 +290,8 @@ fn subscription_node(
     // Custom header so the disclosure triangle expands the rules while a
     // click on the name opens the subscription (matches queue behavior).
     let id = ui.make_persistent_id(("subscription", &topic, &name));
-    let state = egui::collapsing_header::CollapsingState::load_with_default_open(
-        ui.ctx(),
-        id,
-        false,
-    );
+    let state =
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
     let header = state.show_header(ui, |ui| {
         let response = ui
             .selectable_label(false, label)
@@ -333,7 +330,12 @@ fn subscription_node(
             ui.spinner();
         }
         Some(Loadable::Failed(e)) => {
-            failed_row(ui, e, AppAction::LoadRules(topic.clone(), name.clone()), actions);
+            failed_row(
+                ui,
+                e,
+                AppAction::LoadRules(topic.clone(), name.clone()),
+                actions,
+            );
         }
         Some(Loadable::Loaded(rules)) => {
             for rule in rules {

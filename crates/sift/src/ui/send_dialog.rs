@@ -18,6 +18,8 @@ pub struct SendDialog {
     pub ttl_seconds: String,
     pub properties: Vec<(String, String)>,
     pub repeat: u32,
+    /// Minutes from now to schedule delivery; empty/0 sends immediately.
+    pub schedule_in_minutes: String,
     pub error: Option<String>,
 }
 
@@ -36,7 +38,22 @@ impl SendDialog {
             ttl_seconds: String::new(),
             properties: Vec::new(),
             repeat: 1,
+            schedule_in_minutes: String::new(),
             error: None,
+        }
+    }
+
+    /// When set, delivery is scheduled this many minutes from now. Returns an
+    /// error string if the field is present but not a positive number.
+    pub fn schedule_minutes(&self) -> Result<Option<i64>, String> {
+        match self.schedule_in_minutes.trim() {
+            "" | "0" => Ok(None),
+            text => text
+                .parse::<i64>()
+                .ok()
+                .filter(|m| *m > 0)
+                .map(Some)
+                .ok_or_else(|| "Schedule must be a positive number of minutes.".to_owned()),
         }
     }
 
@@ -166,6 +183,13 @@ pub fn show(ctx: &egui::Context, dialog: &mut SendDialog) -> Option<SendAction> 
                     "required for session entities",
                 );
                 field(ui, "TTL (s)", &mut dialog.ttl_seconds, "entity default");
+                ui.end_row();
+                field(
+                    ui,
+                    "Schedule (min)",
+                    &mut dialog.schedule_in_minutes,
+                    "send now if blank",
+                );
                 ui.end_row();
             });
 

@@ -214,6 +214,9 @@ pub struct MessagesView {
     pub fetch_count: u32,
     /// Body viewer: show hex instead of text.
     pub show_hex: bool,
+    /// Sequence numbers of messages deferred from this view, so they can be
+    /// retrieved later (the service returns nothing on defer).
+    pub deferred_seqs: Vec<i64>,
 }
 
 impl MessagesView {
@@ -226,6 +229,7 @@ impl MessagesView {
             error: None,
             fetch_count,
             show_hex: false,
+            deferred_seqs: Vec::new(),
         }
     }
 
@@ -346,6 +350,20 @@ pub enum AppAction {
     OpenDashboard,
     RefreshDashboard,
     SetDashboardAutoRefresh(AutoRefresh),
+    /// Cancel a scheduled message by sequence number.
+    CancelScheduled {
+        target: EntityPath,
+        sequence_number: i64,
+    },
+    /// Retrieve deferred messages (by tracked sequence numbers) into a view.
+    ReceiveDeferred {
+        source: MessageSource,
+        sequence_numbers: Vec<i64>,
+    },
+    ExportNamespace,
+    ImportNamespace {
+        overwrite: bool,
+    },
 }
 
 /// A running long-operation, tracked for the operations strip.

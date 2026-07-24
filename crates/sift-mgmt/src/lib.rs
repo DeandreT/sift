@@ -9,6 +9,7 @@ mod atom;
 pub mod client;
 pub mod error;
 pub mod model;
+pub mod transfer;
 mod write;
 
 pub use client::{Authorizer, ManagementClient};
@@ -19,3 +20,4 @@ pub use model::{
     SubscriptionProperties, TopicInfo, TopicProperties, format_iso8601, is_unlimited,
     parse_iso8601, unlimited,
 };
+pub use transfer::{ImportOutcome, ImportPolicy, NamespaceExport};

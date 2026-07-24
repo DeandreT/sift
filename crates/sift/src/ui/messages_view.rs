@@ -4,7 +4,7 @@
 use egui_extras::{Column, TableBuilder};
 use sift_backend::{Disposition, MessageSource, ReceiveMode};
 use sift_core::body::{BodyFormat, hex_dump};
-use sift_core::message::SiftMessage;
+use sift_core::message::{MessageState, SiftMessage};
 
 use crate::state::{AppAction, MessagesView};
 
@@ -104,8 +104,12 @@ fn toolbar(
         );
 
         // Settlement actions for the selected locked message.
-        let lock_token = view.selected_message().and_then(|m| m.lock_token.clone());
-        if let Some(token) = lock_token {
+        let selected = view
+            .selected_message()
+            .map(|m| (m.lock_token.clone(), m.sequence_number, m.state));
+        let mut newly_deferred = None;
+        if let Some((Some(token), seq, _)) = &selected {
+            let (token, seq) = (token.clone(), *seq);
             ui.separator();
             let settle = |disposition: Disposition| AppAction::Settle {
                 source: source.clone(),
@@ -126,14 +130,54 @@ fn toolbar(
             {
                 actions.push(settle(Disposition::Abandon));
             }
-            if ui.button("Defer").clicked() {
+            if ui
+                .button("Defer")
+                .on_hover_text("Set aside; retrievable by sequence number")
+                .clicked()
+            {
                 actions.push(settle(Disposition::Defer));
+                newly_deferred = Some(seq);
             }
             if !source.dead_letter && ui.button("Dead-letter").clicked() {
                 actions.push(settle(Disposition::DeadLetter {
                     reason: Some("sift".into()),
                     description: None,
                 }));
+            }
+        }
+        // Cancel a selected scheduled message by its sequence number.
+        if let Some((_, seq, MessageState::Scheduled)) = &selected {
+            ui.separator();
+            if ui
+                .button("Cancel scheduled")
+                .on_hover_text("Remove this scheduled message")
+                .clicked()
+            {
+                actions.push(AppAction::CancelScheduled {
+                    target: send_target(source),
+                    sequence_number: *seq,
+                });
+            }
+        }
+        if let Some(seq) = newly_deferred {
+            view.deferred_seqs.push(seq);
+        }
+        // Retrieve messages deferred from this view during the session.
+        if !view.deferred_seqs.is_empty() {
+            ui.separator();
+            if ui
+                .button(format!(
+                    "{} Retrieve deferred ({})",
+                    egui_phosphor::regular::TRAY_ARROW_UP,
+                    view.deferred_seqs.len()
+                ))
+                .clicked()
+            {
+                actions.push(AppAction::ReceiveDeferred {
+                    source: source.clone(),
+                    sequence_numbers: view.deferred_seqs.clone(),
+                });
+                view.deferred_seqs.clear();
             }
         }
 

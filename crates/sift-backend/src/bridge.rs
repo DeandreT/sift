@@ -294,6 +294,42 @@ pub enum Command {
         target: EntityPath,
         messages: Vec<OutboundMessage>,
     },
+    /// Schedule messages for future enqueue; the response carries their
+    /// scheduled sequence numbers.
+    ScheduleMessages {
+        req: RequestId,
+        ns: NamespaceId,
+        target: EntityPath,
+        messages: Vec<OutboundMessage>,
+        enqueue_at: time::OffsetDateTime,
+    },
+    /// Cancel a scheduled message by its sequence number.
+    CancelScheduled {
+        req: RequestId,
+        ns: NamespaceId,
+        target: EntityPath,
+        sequence_number: i64,
+    },
+    /// Retrieve previously deferred messages by sequence number (peek-lock).
+    ReceiveDeferred {
+        req: RequestId,
+        ns: NamespaceId,
+        source: MessageSource,
+        sequence_numbers: Vec<i64>,
+    },
+    /// Export the namespace's entity descriptions to a JSON file.
+    ExportNamespace {
+        req: RequestId,
+        ns: NamespaceId,
+        path: std::path::PathBuf,
+    },
+    /// Create entities from a JSON export file.
+    ImportNamespace {
+        req: RequestId,
+        ns: NamespaceId,
+        path: std::path::PathBuf,
+        overwrite: bool,
+    },
     /// Drain all messages from a queue/subscription (or its dead-letter
     /// sub-queue) using receive-and-delete.
     StartPurge {
@@ -374,7 +410,19 @@ pub enum Event {
         req: RequestId,
         target: EntityPath,
         count: usize,
+        /// Sequence numbers when this was a schedule; empty for a plain send.
+        result: Result<Vec<i64>, BackendError>,
+    },
+    ScheduledCancelled {
+        req: RequestId,
+        target: EntityPath,
+        sequence_number: i64,
         result: Result<(), BackendError>,
+    },
+    /// One-line summary of an import/export, e.g. "exported 12 entities".
+    NamespaceTransfer {
+        req: RequestId,
+        result: Result<String, BackendError>,
     },
     OpProgress {
         op: OpId,

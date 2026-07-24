@@ -252,14 +252,32 @@ impl SiftApp {
                 result,
                 ..
             } => match result {
-                Ok(()) => {
+                Ok(seqs) => {
+                    let verb = if seqs.is_empty() { "Sent" } else { "Scheduled" };
                     self.toast(
                         ToastKind::Success,
-                        format!("Sent {count} message(s) to '{target}'"),
+                        format!("{verb} {count} message(s) to '{target}'"),
                     );
                     if self.open_entities.contains_key(&target) {
                         self.run_action(AppAction::RefreshEntity(target));
                     }
+                }
+                Err(e) => self.toast(ToastKind::Error, e.message),
+            },
+            Event::ScheduledCancelled { target, result, .. } => match result {
+                Ok(()) => {
+                    self.toast(ToastKind::Success, "Cancelled the scheduled message");
+                    if self.open_entities.contains_key(&target) {
+                        self.run_action(AppAction::RefreshEntity(target));
+                    }
+                }
+                Err(e) => self.toast(ToastKind::Error, e.message),
+            },
+            Event::NamespaceTransfer { result, .. } => match result {
+                Ok(summary) => {
+                    tracing::info!("{summary}");
+                    self.toast(ToastKind::Success, summary);
+                    self.tree.clear(); // imported entities may have appeared
                 }
                 Err(e) => self.toast(ToastKind::Error, e.message),
             },
@@ -535,6 +553,38 @@ impl SiftApp {
                 self.dashboard.auto_refresh = mode;
                 self.schedule_dashboard_refresh();
             }
+            AppAction::CancelScheduled {
+                target,
+                sequence_number,
+            } => {
+                if let Some(ns) = ns {
+                    let req = self.backend.next_request();
+                    self.backend.send(Command::CancelScheduled {
+                        req,
+                        ns,
+                        target,
+                        sequence_number,
+                    });
+                }
+            }
+            AppAction::ReceiveDeferred {
+                source,
+                sequence_numbers,
+            } => {
+                if let Some(ns) = ns {
+                    let view = self.tab_state(&source.entity).view_mut(source.dead_letter);
+                    view.loading = true;
+                    let req = self.backend.next_request();
+                    self.backend.send(Command::ReceiveDeferred {
+                        req,
+                        ns,
+                        source,
+                        sequence_numbers,
+                    });
+                }
+            }
+            AppAction::ExportNamespace => self.export_namespace(),
+            AppAction::ImportNamespace { overwrite } => self.import_namespace(overwrite),
             AppAction::PeekMessages {
                 source,
                 from_seq,
@@ -773,6 +823,49 @@ impl SiftApp {
         }
     }
 
+    fn export_namespace(&mut self) {
+        let Some(ns) = self.namespace_id() else {
+            return;
+        };
+        let default_name = match &self.conn {
+            ConnectionState::Connected { info, .. } => format!("{}-export.json", info.name),
+            _ => "sift-export.json".to_owned(),
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export namespace entities")
+            .add_filter("JSON", &["json"])
+            .set_file_name(default_name)
+            .save_file()
+        else {
+            return;
+        };
+        let req = self.backend.next_request();
+        self.backend
+            .send(Command::ExportNamespace { req, ns, path });
+        self.toast(ToastKind::Info, "Exporting…");
+    }
+
+    fn import_namespace(&mut self, overwrite: bool) {
+        let Some(ns) = self.namespace_id() else {
+            return;
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Import namespace entities")
+            .add_filter("JSON", &["json"])
+            .pick_file()
+        else {
+            return;
+        };
+        let req = self.backend.next_request();
+        self.backend.send(Command::ImportNamespace {
+            req,
+            ns,
+            path,
+            overwrite,
+        });
+        self.toast(ToastKind::Info, "Importing…");
+    }
+
     fn persist_config(&mut self) {
         if let Err(e) = self.config.save() {
             tracing::error!("failed to save config: {e}");
@@ -808,6 +901,31 @@ impl SiftApp {
                     actions.push(AppAction::Disconnect);
                     ui.close();
                 }
+                ui.separator();
+                let connected = matches!(self.conn, ConnectionState::Connected { .. });
+                if ui
+                    .add_enabled(connected, egui::Button::new("Export entities…"))
+                    .clicked()
+                {
+                    actions.push(AppAction::ExportNamespace);
+                    ui.close();
+                }
+                ui.menu_button("Import entities", |ui| {
+                    if ui
+                        .add_enabled(connected, egui::Button::new("Create missing only"))
+                        .clicked()
+                    {
+                        actions.push(AppAction::ImportNamespace { overwrite: false });
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(connected, egui::Button::new("Create and overwrite"))
+                        .clicked()
+                    {
+                        actions.push(AppAction::ImportNamespace { overwrite: true });
+                        ui.close();
+                    }
+                });
                 ui.separator();
                 if ui.button("Import legacy profiles…").clicked() {
                     actions.push(AppAction::ImportLegacyProfiles);
@@ -859,6 +977,44 @@ impl SiftApp {
                 );
             });
         });
+    }
+
+    /// Validate and dispatch a send/schedule from the dialog. Returns the
+    /// dialog to keep it open when validation fails, or `None` when it should
+    /// close after a successful submit.
+    fn submit_send_dialog(&mut self, mut dialog: SendDialog) -> Option<SendDialog> {
+        let schedule = match dialog.schedule_minutes() {
+            Ok(schedule) => schedule,
+            Err(e) => {
+                dialog.error = Some(e);
+                return Some(dialog);
+            }
+        };
+        let Some(messages) = dialog.build() else {
+            return Some(dialog); // validation error shown inline
+        };
+        let ns = self.namespace_id()?; // not connected → close the dialog
+        let target = dialog.target.clone();
+        let req = self.backend.next_request();
+        match schedule {
+            Some(minutes) => {
+                let enqueue_at = time::OffsetDateTime::now_utc() + time::Duration::minutes(minutes);
+                self.backend.send(Command::ScheduleMessages {
+                    req,
+                    ns,
+                    target,
+                    messages,
+                    enqueue_at,
+                });
+            }
+            None => self.backend.send(Command::SendMessages {
+                req,
+                ns,
+                target,
+                messages,
+            }),
+        }
+        None
     }
 
     /// Arm the next auto-refresh tick from the current cadence.
@@ -972,20 +1128,9 @@ impl SiftApp {
 
         if let Some(mut dialog) = self.send_dialog.take() {
             match send_dialog::show(ctx, &mut dialog) {
-                Some(SendAction::Send) => match dialog.build() {
-                    Some(messages) => {
-                        if let Some(ns) = self.namespace_id() {
-                            let req = self.backend.next_request();
-                            self.backend.send(Command::SendMessages {
-                                req,
-                                ns,
-                                target: dialog.target.clone(),
-                                messages,
-                            });
-                        }
-                    }
-                    None => self.send_dialog = Some(dialog), // validation error shown inline
-                },
+                Some(SendAction::Send) => {
+                    self.send_dialog = self.submit_send_dialog(dialog);
+                }
                 Some(SendAction::Close) => {}
                 None => self.send_dialog = Some(dialog),
             }

@@ -196,6 +196,73 @@ impl SbRuntime {
         target: &EntityPath,
         messages: Vec<OutboundMessage>,
     ) -> Result<usize, BackendError> {
+        let count = messages.len();
+        let outgoing = build_messages(&messages)?;
+        let sender = self.sender(target).await?;
+        sender.send_messages(outgoing).await.map_err(amqp_err)?;
+        Ok(count)
+    }
+
+    /// Schedule messages for future enqueue; returns their sequence numbers.
+    pub async fn schedule(
+        &mut self,
+        target: &EntityPath,
+        messages: Vec<OutboundMessage>,
+        enqueue_at: time::OffsetDateTime,
+    ) -> Result<Vec<i64>, BackendError> {
+        let outgoing = build_messages(&messages)?;
+        let sender = self.sender(target).await?;
+        sender
+            .schedule_messages(outgoing, enqueue_at)
+            .await
+            .map_err(amqp_err)
+    }
+
+    pub async fn cancel_scheduled(
+        &mut self,
+        target: &EntityPath,
+        sequence_number: i64,
+    ) -> Result<(), BackendError> {
+        let sender = self.sender(target).await?;
+        sender
+            .cancel_scheduled_message(sequence_number)
+            .await
+            .map_err(amqp_err)
+    }
+
+    /// Retrieve deferred messages by sequence number. They come back locked,
+    /// so they are registered like any other peek-lock receive.
+    pub async fn receive_deferred(
+        &mut self,
+        source: &MessageSource,
+        sequence_numbers: Vec<i64>,
+    ) -> Result<Vec<SiftMessage>, BackendError> {
+        let received = {
+            let receiver = self.receiver(source).await?;
+            receiver
+                .receive_deferred_messages(sequence_numbers)
+                .await
+                .map_err(amqp_err)?
+        };
+        let mut out = Vec::with_capacity(received.len());
+        for message in received {
+            let mut sift = from_received(&message);
+            let token = uuid::Uuid::from_bytes(*message.lock_token().as_inner()).to_string();
+            sift.lock_token = Some(token.clone());
+            self.locked.insert(
+                token,
+                LockedMessage {
+                    source: source.clone(),
+                    message,
+                },
+            );
+            out.push(sift);
+        }
+        Ok(out)
+    }
+
+    /// Get (or open) the sender for a queue or topic.
+    async fn sender(&mut self, target: &EntityPath) -> Result<&mut ServiceBusSender, BackendError> {
         let path = match target {
             EntityPath::Queue(name) | EntityPath::Topic(name) => name.clone(),
             other => {
@@ -205,24 +272,18 @@ impl SbRuntime {
                 )));
             }
         };
-        let count = messages.len();
-        let outgoing: Result<Vec<ServiceBusMessage>, BackendError> =
-            messages.iter().map(to_service_bus_message).collect();
-        let outgoing = outgoing?;
-
-        let sender = match self.senders.entry(path.clone()) {
-            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                let sender = self
-                    .client
-                    .create_sender(&path, ServiceBusSenderOptions::default())
-                    .await
-                    .map_err(amqp_err)?;
-                e.insert(sender)
-            }
-        };
-        sender.send_messages(outgoing).await.map_err(amqp_err)?;
-        Ok(count)
+        if !self.senders.contains_key(&path) {
+            let sender = self
+                .client
+                .create_sender(&path, ServiceBusSenderOptions::default())
+                .await
+                .map_err(amqp_err)?;
+            self.senders.insert(path.clone(), sender);
+        }
+        Ok(self
+            .senders
+            .get_mut(&path)
+            .expect("sender was just inserted"))
     }
 
     /// Get (or open) the peek-lock receiver for a source. Receive-and-delete
@@ -369,6 +430,10 @@ fn from_received(m: &azservicebus::ServiceBusReceivedMessage) -> SiftMessage {
         application_properties: app_properties(m.application_properties()),
         body: decoded_body(m.body().ok(), &m.raw_amqp_message().body),
     }
+}
+
+fn build_messages(messages: &[OutboundMessage]) -> Result<Vec<ServiceBusMessage>, BackendError> {
+    messages.iter().map(to_service_bus_message).collect()
 }
 
 fn to_service_bus_message(out: &OutboundMessage) -> Result<ServiceBusMessage, BackendError> {
