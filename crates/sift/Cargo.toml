@@ -1,0 +1,28 @@
+[package]
+name = "sift"
+description = "Cross-platform Azure Service Bus explorer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+eframe = { workspace = true, features = ["persistence"] }
+egui.workspace = true
+egui-phosphor.workspace = true
+egui-toast.workspace = true
+egui_dock = { workspace = true, features = ["serde"] }
+rfd.workspace = true
+serde.workspace = true
+sift-backend.workspace = true
+sift-core.workspace = true
+sift-mgmt.workspace = true
+time.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

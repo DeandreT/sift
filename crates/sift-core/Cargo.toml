@@ -1,0 +1,28 @@
+[package]
+name = "sift-core"
+description = "Core domain logic for sift: connection strings, SAS tokens, configuration, secret storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+base64.workspace = true
+directories.workspace = true
+hmac.workspace = true
+keyring.workspace = true
+percent-encoding.workspace = true
+quick-xml.workspace = true
+serde.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+time.workspace = true
+toml.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

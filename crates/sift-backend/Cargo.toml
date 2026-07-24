@@ -1,0 +1,19 @@
+[package]
+name = "sift-backend"
+description = "Async backend for sift: tokio runtime, command/event bridge, Azure clients"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+crossbeam-channel.workspace = true
+sift-core.workspace = true
+sift-mgmt.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

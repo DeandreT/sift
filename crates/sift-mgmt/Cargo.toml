@@ -1,0 +1,19 @@
+[package]
+name = "sift-mgmt"
+description = "ATOM-XML management REST client for Azure Service Bus namespaces"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+quick-xml.workspace = true
+reqwest.workspace = true
+sift-core.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true

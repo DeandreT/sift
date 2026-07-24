@@ -1,0 +1,88 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/sift",
+    "crates/sift-backend",
+    "crates/sift-core",
+    "crates/sift-mgmt",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+
+[workspace.dependencies]
+sift-backend = { path = "crates/sift-backend" }
+sift-core = { path = "crates/sift-core" }
+sift-mgmt = { path = "crates/sift-mgmt" }
+
+# GUI — egui-family crates move in lockstep; upgrade them together in one change.
+eframe = "0.35"
+egui = "0.35"
+egui-phosphor = "0.13"
+egui-toast = "0.21"
+egui_dock = "0.20"
+egui_extras = "0.35"
+
+# Async runtime and channels
+crossbeam-channel = "0.5"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-util = "0.7"
+
+# HTTP + XML (management REST API)
+quick-xml = "0.41"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+
+# SAS token crypto
+base64 = "0.22"
+hmac = "0.12"
+percent-encoding = "2"
+sha2 = "0.10"
+
+# Utilities
+anyhow = "1"
+directories = "6"
+rfd = "0.17"
+keyring = "4"
+tempfile = "3"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = { version = "2", features = ["serde"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+zeroize = "1"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Pragmatic opt-outs from pedantic.
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+# Hard lines.
+dbg_macro = "warn"
+todo = "warn"
+unwrap_used = "warn"
+
+# egui, TLS, and AMQP are unusably slow at opt-level 0.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
