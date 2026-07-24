@@ -113,6 +113,21 @@ pub fn render_entity(
         ui.label(egui::RichText::new("Not connected.").weak());
         return;
     }
+    // Salt the ID space per entity so two tabs visible at once (dock splits,
+    // pop-outs) don't clash on fixed widget IDs inside the viewers.
+    ui.push_id(path, |ui| {
+        render_entity_inner(ui, entities, peek_batch, path, popped, actions);
+    });
+}
+
+fn render_entity_inner(
+    ui: &mut egui::Ui,
+    entities: &mut HashMap<EntityPath, EntityTabState>,
+    peek_batch: u32,
+    path: &EntityPath,
+    popped: bool,
+    actions: &mut Vec<AppAction>,
+) {
     let state = entities
         .entry(path.clone())
         .or_insert_with(|| EntityTabState::new(peek_batch));

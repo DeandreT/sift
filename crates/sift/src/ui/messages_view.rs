@@ -404,8 +404,10 @@ fn message_viewer(ui: &mut egui::Ui, view: &mut MessagesView) {
         });
     });
 
-    // Body on the left, properties on the right (resizable split).
-    egui::Panel::right("message-props")
+    // Body on the left, properties on the right (resizable split). The panel
+    // id must be salted per ui (panels keep their own persisted state and
+    // don't inherit the id stack), or two visible viewers clash.
+    egui::Panel::right(ui.id().with("message-props"))
         .resizable(true)
         .default_size(280.0)
         .show(ui, |ui| {
