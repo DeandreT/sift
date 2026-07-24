@@ -17,8 +17,38 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RequestId(pub u64);
 
+/// Identifies a long-running, cancellable operation (purge, resubmit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OpId(pub u64);
+
 /// Namespaces are identified by their profile id.
 pub type NamespaceId = Uuid;
+
+/// The kind of long-running operation, for display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpKind {
+    Purge,
+    Resubmit,
+}
+
+impl OpKind {
+    #[must_use]
+    pub fn verb(self) -> &'static str {
+        match self {
+            Self::Purge => "Purge",
+            Self::Resubmit => "Resubmit",
+        }
+    }
+}
+
+/// Final tally of a completed operation.
+#[derive(Debug, Clone)]
+pub struct OpSummary {
+    pub kind: OpKind,
+    pub processed: u64,
+    /// What was purged/resubmitted, for the toast/log.
+    pub target: String,
+}
 
 /// Addresses one entity inside the connected namespace.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -264,6 +294,21 @@ pub enum Command {
         target: EntityPath,
         messages: Vec<OutboundMessage>,
     },
+    /// Drain all messages from a queue/subscription (or its dead-letter
+    /// sub-queue) using receive-and-delete.
+    StartPurge {
+        op: OpId,
+        ns: NamespaceId,
+        source: MessageSource,
+    },
+    /// Move every message from a dead-letter sub-queue back onto `target`.
+    StartResubmit {
+        op: OpId,
+        ns: NamespaceId,
+        source: MessageSource,
+        target: EntityPath,
+    },
+    CancelOp(OpId),
     Shutdown,
 }
 
@@ -331,6 +376,19 @@ pub enum Event {
         count: usize,
         result: Result<(), BackendError>,
     },
+    OpProgress {
+        op: OpId,
+        kind: OpKind,
+        /// Items processed so far.
+        done: u64,
+        /// Human-readable target, e.g. `orders/$DeadLetterQueue`.
+        target: String,
+    },
+    OpFinished {
+        op: OpId,
+        result: Result<OpSummary, BackendError>,
+        cancelled: bool,
+    },
 }
 
 /// A user-presentable error from a backend operation.
@@ -388,6 +446,11 @@ impl BackendHandle {
     #[must_use]
     pub fn next_request(&self) -> RequestId {
         RequestId(self.next_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    #[must_use]
+    pub fn next_op(&self) -> OpId {
+        OpId(self.next_id.fetch_add(1, Ordering::Relaxed))
     }
 
     /// Send a command. The backend outlives the UI, so a closed channel only

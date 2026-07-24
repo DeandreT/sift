@@ -21,21 +21,20 @@ use crate::bridge::{BackendError, Disposition, EntityPath, MessageSource, Receiv
 
 /// Peek-locked messages waiting for the UI to settle them.
 struct LockedMessage {
-    key: ReceiverKey,
-    message: azservicebus::ServiceBusReceivedMessage,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ReceiverKey {
     source: MessageSource,
-    mode: ReceiveMode,
+    message: azservicebus::ServiceBusReceivedMessage,
 }
 
 /// One namespace's AMQP state. All operations take `&mut self` because the
 /// azservicebus client and links do; callers hold this behind a tokio Mutex.
+///
+/// Receivers are always opened in peek-lock mode — azservicebus's
+/// receive-and-delete path errors with `LockTokenNotFound` on brokers that
+/// don't return a lock token for pre-settled deliveries, so sift implements
+/// receive-and-delete as peek-lock followed by an immediate complete.
 pub struct SbRuntime {
     client: ServiceBusClient<BasicRetryPolicy>,
-    receivers: HashMap<ReceiverKey, ServiceBusReceiver>,
+    receivers: HashMap<MessageSource, ServiceBusReceiver>,
     senders: HashMap<String, ServiceBusSender>,
     locked: HashMap<String, LockedMessage>,
 }
@@ -86,7 +85,7 @@ impl SbRuntime {
         from_seq: Option<i64>,
         count: u32,
     ) -> Result<Vec<SiftMessage>, BackendError> {
-        let receiver = self.receiver(source, ReceiveMode::PeekLock).await?;
+        let receiver = self.receiver(source).await?;
         let peeked = receiver
             .peek_messages(count, Some(from_seq.unwrap_or(0)))
             .await
@@ -94,8 +93,9 @@ impl SbRuntime {
         Ok(peeked.iter().map(from_peeked).collect())
     }
 
-    /// Receive messages. Peek-locked ones are retained in the lock registry
-    /// so they can be settled later; receive-and-delete ones are consumed.
+    /// Receive messages. Peek-locked ones are retained in the lock registry so
+    /// they can be settled later; receive-and-delete ones are completed
+    /// immediately (see the struct docs for why this isn't a native `RaD` link).
     pub async fn receive(
         &mut self,
         source: &MessageSource,
@@ -103,29 +103,45 @@ impl SbRuntime {
         count: u32,
         max_wait: std::time::Duration,
     ) -> Result<Vec<SiftMessage>, BackendError> {
-        let receiver = self.receiver(source, mode).await?;
-        let batch = receiver
-            .receive_messages_with_max_wait_time(count, max_wait)
-            .await
-            .map_err(amqp_err)?;
-
-        let key = ReceiverKey {
-            source: source.clone(),
-            mode,
+        // Phase 1: receive the batch, then let the receiver borrow end so the
+        // per-message handling below can touch other fields of `self`.
+        let batch = {
+            let receiver = self.receiver(source).await?;
+            receiver
+                .receive_messages_with_max_wait_time(count, max_wait)
+                .await
+                .map_err(amqp_err)?
         };
+
+        // Phase 2: settle (RaD) or register the lock (peek-lock). Each arm
+        // borrows a disjoint field, so re-fetching the receiver here avoids
+        // holding it across the `self.locked` access.
         let mut out = Vec::with_capacity(batch.len());
         for message in batch {
             let mut sift = from_received(&message);
-            if mode == ReceiveMode::PeekLock {
-                let token = uuid::Uuid::from_bytes(*message.lock_token().as_inner()).to_string();
-                sift.lock_token = Some(token.clone());
-                self.locked.insert(
-                    token,
-                    LockedMessage {
-                        key: key.clone(),
-                        message,
-                    },
-                );
+            match mode {
+                ReceiveMode::ReceiveAndDelete => {
+                    let receiver = self
+                        .receivers
+                        .get_mut(source)
+                        .expect("receiver created in phase 1");
+                    receiver
+                        .complete_message(&message)
+                        .await
+                        .map_err(amqp_err)?;
+                }
+                ReceiveMode::PeekLock => {
+                    let token =
+                        uuid::Uuid::from_bytes(*message.lock_token().as_inner()).to_string();
+                    sift.lock_token = Some(token.clone());
+                    self.locked.insert(
+                        token,
+                        LockedMessage {
+                            source: source.clone(),
+                            message,
+                        },
+                    );
+                }
             }
             out.push(sift);
         }
@@ -143,7 +159,7 @@ impl SbRuntime {
                 "the message lock is no longer held (it may have expired)",
             ));
         };
-        let Some(receiver) = self.receivers.get_mut(&locked.key) else {
+        let Some(receiver) = self.receivers.get_mut(&locked.source) else {
             return Err(BackendError::new("the receiver for this message is gone"));
         };
 
@@ -209,21 +225,15 @@ impl SbRuntime {
         Ok(count)
     }
 
+    /// Get (or open) the peek-lock receiver for a source. Receive-and-delete
+    /// semantics are layered on top in [`Self::receive`].
     async fn receiver(
         &mut self,
         source: &MessageSource,
-        mode: ReceiveMode,
     ) -> Result<&mut ServiceBusReceiver, BackendError> {
-        let key = ReceiverKey {
-            source: source.clone(),
-            mode,
-        };
-        if !self.receivers.contains_key(&key) {
+        if !self.receivers.contains_key(source) {
             let options = ServiceBusReceiverOptions {
-                receive_mode: match mode {
-                    ReceiveMode::PeekLock => ServiceBusReceiveMode::PeekLock,
-                    ReceiveMode::ReceiveAndDelete => ServiceBusReceiveMode::ReceiveAndDelete,
-                },
+                receive_mode: ServiceBusReceiveMode::PeekLock,
                 sub_queue: if source.dead_letter {
                     SubQueue::DeadLetter
                 } else {
@@ -249,11 +259,11 @@ impl SbRuntime {
                     )));
                 }
             };
-            self.receivers.insert(key.clone(), receiver);
+            self.receivers.insert(source.clone(), receiver);
         }
         Ok(self
             .receivers
-            .get_mut(&key)
+            .get_mut(source)
             .expect("receiver was just inserted"))
     }
 }

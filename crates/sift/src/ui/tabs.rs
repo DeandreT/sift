@@ -5,18 +5,23 @@ use std::collections::HashMap;
 
 use sift_backend::{EntityPath, MessageSource};
 
-use crate::state::{AppAction, ConnectionState, EntityPage, EntityTabState, Loadable};
-use crate::ui::{entity_view, messages_view};
+use crate::state::{
+    AppAction, ConnectionState, DashboardState, EntityPage, EntityTabState, EntityTree, Loadable,
+};
+use crate::ui::{dashboard, entity_view, messages_view};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum TabId {
     Welcome,
+    Dashboard,
     Entity(EntityPath),
 }
 
 /// Borrowed view of app state handed to the dock each frame.
 pub struct TabViewerCtx<'a> {
     pub conn: &'a ConnectionState,
+    pub tree: &'a EntityTree,
+    pub dashboard: &'a mut DashboardState,
     pub entities: &'a mut HashMap<EntityPath, EntityTabState>,
     pub peek_batch: u32,
     pub actions: &'a mut Vec<AppAction>,
@@ -28,6 +33,7 @@ impl egui_dock::TabViewer for TabViewerCtx<'_> {
     fn title(&mut self, tab: &mut TabId) -> egui::WidgetText {
         match tab {
             TabId::Welcome => "Welcome".into(),
+            TabId::Dashboard => "Dashboard".into(),
             TabId::Entity(path) => path.name().into(),
         }
     }
@@ -35,6 +41,9 @@ impl egui_dock::TabViewer for TabViewerCtx<'_> {
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut TabId) {
         match tab {
             TabId::Welcome => self.welcome(ui),
+            TabId::Dashboard => {
+                dashboard::show(ui, self.tree, self.dashboard, self.actions);
+            }
             TabId::Entity(path) => render_entity(
                 ui,
                 self.conn,

@@ -1,4 +1,5 @@
 pub mod connect_dialog;
+pub mod dashboard;
 pub mod dialogs;
 pub mod entity_view;
 pub mod log_panel;

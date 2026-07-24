@@ -57,7 +57,9 @@ pub struct SiftMessage {
 
 impl SiftMessage {
     /// Prefill an outbound message from this one (resend/resubmit): keeps the
-    /// body and user-settable properties, drops all system properties.
+    /// body and user-settable properties, drops all system properties —
+    /// including dead-letter metadata, so a resubmitted message is a clean
+    /// copy rather than one that still reads as dead-lettered.
     #[must_use]
     pub fn to_outbound(&self) -> OutboundMessage {
         OutboundMessage {
@@ -71,9 +73,23 @@ impl SiftMessage {
             to: self.to.clone(),
             reply_to: self.reply_to.clone(),
             time_to_live: self.time_to_live,
-            application_properties: self.application_properties.clone(),
+            application_properties: self
+                .application_properties
+                .iter()
+                .filter(|(k, _)| !is_dead_letter_property(k))
+                .cloned()
+                .collect(),
         }
     }
+}
+
+/// Dead-letter metadata the broker stores as application properties; these
+/// must not be carried onto a resubmitted message.
+fn is_dead_letter_property(key: &str) -> bool {
+    matches!(
+        key,
+        "DeadLetterReason" | "DeadLetterErrorDescription" | "DeadLetterSource"
+    )
 }
 
 /// A message to send, composed in the UI.

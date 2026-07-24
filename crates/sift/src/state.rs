@@ -3,7 +3,9 @@
 
 use std::collections::HashMap;
 
-use sift_backend::{Disposition, EntityInfo, EntityPath, MessageSource, ReceiveMode, RequestId};
+use sift_backend::{
+    Disposition, EntityInfo, EntityPath, MessageSource, OpId, OpKind, ReceiveMode, RequestId,
+};
 use sift_core::message::{OutboundMessage, SiftMessage};
 use sift_mgmt::{NamespaceInfo, QueueInfo, RuleInfo, SubscriptionInfo, TopicInfo};
 use uuid::Uuid;
@@ -63,12 +65,112 @@ pub struct EntityTree {
     pub subscriptions: HashMap<String, Loadable<Vec<SubscriptionInfo>>>,
     /// Keyed by (topic, subscription).
     pub rules: HashMap<(String, String), Loadable<Vec<RuleInfo>>>,
+    pub filter: TreeFilter,
+}
+
+/// Case-insensitive substring filter over the tree, with a short debounce so
+/// typing doesn't recompute every keystroke.
+#[derive(Debug, Default)]
+pub struct TreeFilter {
+    /// The text currently in the filter box.
+    pub text: String,
+    /// The debounced text actually applied to matching.
+    applied: String,
+    /// Set to request focus on the next frame (from Ctrl+F).
+    pub focus_requested: bool,
+    last_edit: Option<std::time::Instant>,
+}
+
+/// Debounce window for the tree filter.
+const FILTER_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
+
+impl TreeFilter {
+    /// Note that the text changed; starts the debounce timer.
+    pub fn on_edit(&mut self) {
+        self.last_edit = Some(std::time::Instant::now());
+    }
+
+    /// Promote `text` to `applied` once the debounce elapses. Returns whether
+    /// a repaint should be scheduled (debounce still pending).
+    pub fn tick(&mut self) -> bool {
+        if let Some(edited) = self.last_edit {
+            if edited.elapsed() >= FILTER_DEBOUNCE {
+                self.applied = self.text.trim().to_lowercase();
+                self.last_edit = None;
+            } else {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn clear(&mut self) {
+        self.text.clear();
+        self.applied.clear();
+        self.last_edit = None;
+    }
+
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        !self.applied.is_empty()
+    }
+
+    /// Does `name` match the applied filter? An empty filter matches all.
+    #[must_use]
+    pub fn matches(&self, name: &str) -> bool {
+        self.applied.is_empty() || name.to_lowercase().contains(&self.applied)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn applied(text: &str) -> TreeFilter {
+        let mut f = TreeFilter {
+            text: text.to_owned(),
+            ..TreeFilter::default()
+        };
+        f.on_edit();
+        // Force the debounce to have already elapsed so tick() applies now.
+        f.last_edit = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(1));
+        f.tick();
+        f
+    }
+
+    #[test]
+    fn empty_filter_matches_everything() {
+        let f = TreeFilter::default();
+        assert!(f.matches("anything"));
+        assert!(!f.is_active());
+    }
+
+    #[test]
+    fn matching_is_case_insensitive_substring() {
+        let f = applied("Order");
+        assert!(f.is_active());
+        assert!(f.matches("orders"));
+        assert!(f.matches("PROCESS-ORDERS"));
+        assert!(!f.matches("invoices"));
+    }
+
+    #[test]
+    fn clear_resets_active_state() {
+        let mut f = applied("x");
+        assert!(f.is_active());
+        f.clear();
+        assert!(!f.is_active());
+        assert!(f.matches("anything"));
+    }
 }
 
 impl EntityTree {
-    /// Forget everything (on disconnect or refresh-all).
+    /// Forget loaded data (on disconnect or refresh-all), keeping the filter.
     pub fn clear(&mut self) {
-        *self = Self::default();
+        self.queues = Loadable::NotLoaded;
+        self.topics = Loadable::NotLoaded;
+        self.subscriptions.clear();
+        self.rules.clear();
     }
 
     /// Drop the cached list that contains `path`, forcing a reload.
@@ -233,4 +335,68 @@ pub enum AppAction {
     PopOutEntity(EntityPath),
     /// Return a popped-out entity to the dock.
     DockEntity(EntityPath),
+    /// Ask for confirmation before draining a source.
+    RequestPurge(MessageSource),
+    /// Move every dead-letter message back onto its parent entity.
+    ResubmitAll {
+        source: MessageSource,
+        target: EntityPath,
+    },
+    CancelOp(OpId),
+    OpenDashboard,
+    RefreshDashboard,
+    SetDashboardAutoRefresh(AutoRefresh),
+}
+
+/// A running long-operation, tracked for the operations strip.
+#[derive(Debug, Clone)]
+pub struct RunningOp {
+    pub op: OpId,
+    pub kind: OpKind,
+    pub done: u64,
+    pub target: String,
+}
+
+/// Dashboard auto-refresh cadence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AutoRefresh {
+    #[default]
+    Off,
+    Secs30,
+    Secs60,
+    Min5,
+}
+
+impl AutoRefresh {
+    pub const ALL: [Self; 4] = [Self::Off, Self::Secs30, Self::Secs60, Self::Min5];
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Secs30 => "30s",
+            Self::Secs60 => "60s",
+            Self::Min5 => "5min",
+        }
+    }
+
+    #[must_use]
+    pub fn interval(self) -> Option<std::time::Duration> {
+        let secs = match self {
+            Self::Off => return None,
+            Self::Secs30 => 30,
+            Self::Secs60 => 60,
+            Self::Min5 => 300,
+        };
+        Some(std::time::Duration::from_secs(secs))
+    }
+}
+
+/// Dashboard tab state (auto-refresh cadence + scheduling).
+#[derive(Debug, Default)]
+pub struct DashboardState {
+    pub auto_refresh: AutoRefresh,
+    pub next_refresh: Option<std::time::Instant>,
+    /// Set by a refresh so subscriptions are reloaded once topics arrive.
+    pub wants_subscriptions: bool,
 }

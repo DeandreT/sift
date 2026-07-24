@@ -17,10 +17,13 @@ use uuid::Uuid;
 
 use crate::logging::LogBuffer;
 use crate::state::{
-    AppAction, ConnectionState, EntityTabState, EntityTree, Loadable, PendingConnect,
+    AppAction, AutoRefresh, ConnectionState, DashboardState, EntityTabState, EntityTree, Loadable,
+    PendingConnect, RunningOp,
 };
 use crate::ui::connect_dialog::{ConnectDialog, DialogAction};
-use crate::ui::dialogs::{ConfirmDeleteAction, ConfirmDeleteDialog, CreateAction, CreateDialog};
+use crate::ui::dialogs::{
+    ConfirmAction, ConfirmDialog, CreateAction, CreateDialog, PendingConfirm,
+};
 use crate::ui::send_dialog::{SendAction, SendDialog};
 use crate::ui::tabs::{self, TabId, TabViewerCtx};
 use crate::ui::{connect_dialog, dialogs, log_panel, send_dialog, tree_panel};
@@ -36,13 +39,15 @@ pub struct SiftApp {
     open_entities: HashMap<EntityPath, EntityTabState>,
     /// Entities detached into their own OS windows (rendered as viewports).
     popped_out: Vec<EntityPath>,
+    dashboard: DashboardState,
     dock: DockState<TabId>,
     log: LogBuffer,
     log_visible: bool,
     connect_dialog: Option<ConnectDialog>,
-    confirm_delete: Option<ConfirmDeleteDialog>,
+    confirm: Option<ConfirmDialog>,
     create_dialog: Option<CreateDialog>,
     send_dialog: Option<SendDialog>,
+    running_ops: Vec<RunningOp>,
     about_open: bool,
     toasts: Toasts,
 }
@@ -79,13 +84,15 @@ impl SiftApp {
             tree: EntityTree::default(),
             open_entities: HashMap::new(),
             popped_out: Vec::new(),
+            dashboard: DashboardState::default(),
             dock: DockState::new(vec![TabId::Welcome]),
             log,
             log_visible: true,
             connect_dialog: None,
-            confirm_delete: None,
+            confirm: None,
             create_dialog: None,
             send_dialog: None,
+            running_ops: Vec::new(),
             about_open: false,
             toasts: Toasts::new()
                 .anchor(egui::Align2::RIGHT_BOTTOM, (-12.0, -12.0))
@@ -124,6 +131,7 @@ impl SiftApp {
                         self.tree.clear();
                         self.open_entities.clear();
                         self.popped_out.clear();
+                        self.running_ops.clear();
                     }
                     Err(e) => {
                         if let Some(detail) = &e.detail {
@@ -140,6 +148,7 @@ impl SiftApp {
                     self.tree.clear();
                     self.open_entities.clear();
                     self.popped_out.clear();
+                    self.running_ops.clear();
                     self.close_entity_tabs();
                 }
             }
@@ -148,6 +157,18 @@ impl SiftApp {
             }
             Event::Topics { result, .. } => {
                 self.tree.topics = load_result(result, &mut self.toasts);
+                // A dashboard refresh needs every subscription's counts, so
+                // fan out subscription loads once the topic list is in.
+                if self.dashboard.wants_subscriptions
+                    && let Loadable::Loaded(topics) = &self.tree.topics
+                {
+                    self.dashboard.wants_subscriptions = false;
+                    let names: Vec<String> =
+                        topics.iter().map(|t| t.properties.name.clone()).collect();
+                    for topic in names {
+                        self.run_action(AppAction::LoadSubscriptions(topic));
+                    }
+                }
             }
             Event::Subscriptions { topic, result, .. } => {
                 self.tree
@@ -242,6 +263,58 @@ impl SiftApp {
                 }
                 Err(e) => self.toast(ToastKind::Error, e.message),
             },
+            Event::OpProgress {
+                op,
+                kind,
+                done,
+                target,
+            } => {
+                if let Some(running) = self.running_ops.iter_mut().find(|o| o.op == op) {
+                    running.done = done;
+                } else {
+                    self.running_ops.push(RunningOp {
+                        op,
+                        kind,
+                        done,
+                        target,
+                    });
+                }
+            }
+            Event::OpFinished {
+                op,
+                result,
+                cancelled,
+            } => {
+                let entity = self.running_ops.iter().find(|o| o.op == op).and_then(|o| {
+                    // Re-derive which entity to refresh from the target label.
+                    self.open_entities
+                        .keys()
+                        .find(|p| o.target.starts_with(p.name()))
+                        .cloned()
+                });
+                self.running_ops.retain(|o| o.op != op);
+                match result {
+                    Ok(summary) => {
+                        let verb = summary.kind.verb();
+                        let msg = if cancelled {
+                            format!(
+                                "{verb} cancelled after {} message(s) on '{}'",
+                                summary.processed, summary.target
+                            )
+                        } else {
+                            format!(
+                                "{verb} finished: {} message(s) on '{}'",
+                                summary.processed, summary.target
+                            )
+                        };
+                        self.toast(ToastKind::Success, msg);
+                    }
+                    Err(e) => self.toast(ToastKind::Error, e.message),
+                }
+                if let Some(path) = entity {
+                    self.run_action(AppAction::RefreshEntity(path));
+                }
+            }
         }
     }
 
@@ -416,10 +489,51 @@ impl SiftApp {
                 self.create_dialog = Some(CreateDialog::new(kind));
             }
             AppAction::RequestDelete(path) => {
-                self.confirm_delete = Some(ConfirmDeleteDialog::new(
-                    path,
+                self.confirm = Some(ConfirmDialog::new(
+                    PendingConfirm::Delete(path),
                     self.config.ui.confirm_delete_typed_name,
                 ));
+            }
+            AppAction::RequestPurge(source) => {
+                self.confirm = Some(ConfirmDialog::new(
+                    PendingConfirm::Purge(source),
+                    self.config.ui.confirm_delete_typed_name,
+                ));
+            }
+            AppAction::ResubmitAll { source, target } => {
+                if let Some(ns) = ns {
+                    let op = self.backend.next_op();
+                    self.backend.send(Command::StartResubmit {
+                        op,
+                        ns,
+                        source,
+                        target,
+                    });
+                }
+            }
+            AppAction::CancelOp(op) => {
+                self.backend.send(Command::CancelOp(op));
+            }
+            AppAction::OpenDashboard => {
+                let tab = TabId::Dashboard;
+                if let Some(location) = self.dock.find_tab(&tab) {
+                    let _ = self.dock.set_active_tab(location);
+                } else {
+                    self.dock.push_to_focused_leaf(tab);
+                }
+                self.run_action(AppAction::RefreshDashboard);
+            }
+            AppAction::RefreshDashboard => {
+                // Load queues + topics now; subscriptions follow once topics
+                // arrive (see the Topics event handler).
+                self.dashboard.wants_subscriptions = true;
+                self.run_action(AppAction::LoadQueues);
+                self.run_action(AppAction::LoadTopics);
+                self.schedule_dashboard_refresh();
+            }
+            AppAction::SetDashboardAutoRefresh(mode) => {
+                self.dashboard.auto_refresh = mode;
+                self.schedule_dashboard_refresh();
             }
             AppAction::PeekMessages {
                 source,
@@ -705,6 +819,14 @@ impl SiftApp {
                 }
             });
             ui.menu_button("View", |ui| {
+                let connected = matches!(self.conn, ConnectionState::Connected { .. });
+                if ui
+                    .add_enabled(connected, egui::Button::new("Dashboard"))
+                    .clicked()
+                {
+                    actions.push(AppAction::OpenDashboard);
+                    ui.close();
+                }
                 if ui.checkbox(&mut self.log_visible, "Log panel").clicked() {
                     ui.close();
                 }
@@ -739,6 +861,55 @@ impl SiftApp {
         });
     }
 
+    /// Arm the next auto-refresh tick from the current cadence.
+    fn schedule_dashboard_refresh(&mut self) {
+        self.dashboard.next_refresh = self
+            .dashboard
+            .auto_refresh
+            .interval()
+            .map(|d| std::time::Instant::now() + d);
+    }
+
+    /// Handle keyboard shortcuts and time-based work (filter debounce,
+    /// dashboard auto-refresh) at the top of each frame.
+    fn tick(&mut self, ctx: &egui::Context, actions: &mut Vec<AppAction>) {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+            self.tree.filter.focus_requested = true;
+        }
+        if self.tree.filter.tick() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(120));
+        }
+
+        let dashboard_open = self.dock.find_tab(&TabId::Dashboard).is_some();
+        if dashboard_open && self.dashboard.auto_refresh != AutoRefresh::Off {
+            let now = std::time::Instant::now();
+            match self.dashboard.next_refresh {
+                Some(at) if now >= at => actions.push(AppAction::RefreshDashboard),
+                Some(at) => ctx.request_repaint_after(at.saturating_duration_since(now)),
+                None => self.schedule_dashboard_refresh(),
+            }
+        }
+    }
+
+    fn operations_strip(&self, ui: &mut egui::Ui, actions: &mut Vec<AppAction>) {
+        for running in &self.running_ops {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(format!(
+                    "{} '{}' — {} message(s)",
+                    running.kind.verb(),
+                    running.target,
+                    running.done
+                ));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Cancel").clicked() {
+                        actions.push(AppAction::CancelOp(running.op));
+                    }
+                });
+            });
+        }
+    }
+
     fn about_window(&mut self, ctx: &egui::Context) {
         let mut open = self.about_open;
         egui::Window::new("About sift")
@@ -762,20 +933,24 @@ impl SiftApp {
             }
         }
 
-        if let Some(mut dialog) = self.confirm_delete.take() {
-            match dialogs::show_confirm_delete(ctx, &mut dialog) {
-                Some(ConfirmDeleteAction::Delete) => {
+        if let Some(mut dialog) = self.confirm.take() {
+            match dialogs::show_confirm(ctx, &mut dialog) {
+                Some(ConfirmAction::Confirm) => {
                     if let Some(ns) = self.namespace_id() {
-                        let req = self.backend.next_request();
-                        self.backend.send(Command::DeleteEntity {
-                            req,
-                            ns,
-                            path: dialog.path,
-                        });
+                        match dialog.action {
+                            PendingConfirm::Delete(path) => {
+                                let req = self.backend.next_request();
+                                self.backend.send(Command::DeleteEntity { req, ns, path });
+                            }
+                            PendingConfirm::Purge(source) => {
+                                let op = self.backend.next_op();
+                                self.backend.send(Command::StartPurge { op, ns, source });
+                            }
+                        }
                     }
                 }
-                Some(ConfirmDeleteAction::Close) => {}
-                None => self.confirm_delete = Some(dialog),
+                Some(ConfirmAction::Close) => {}
+                None => self.confirm = Some(dialog),
             }
         }
 
@@ -885,6 +1060,7 @@ impl eframe::App for SiftApp {
         self.drain_events();
 
         let mut actions: Vec<AppAction> = Vec::new();
+        self.tick(&ctx, &mut actions);
 
         egui::Panel::top("menubar").show(ui, |ui| {
             self.menu_bar(ui, &mut actions);
@@ -892,6 +1068,11 @@ impl eframe::App for SiftApp {
         egui::Panel::bottom("statusbar").show(ui, |ui| {
             self.status_bar(ui);
         });
+        if !self.running_ops.is_empty() {
+            egui::Panel::bottom("operations").show(ui, |ui| {
+                self.operations_strip(ui, &mut actions);
+            });
+        }
         if self.log_visible {
             egui::Panel::bottom("log")
                 .resizable(true)
@@ -906,12 +1087,14 @@ impl eframe::App for SiftApp {
             .default_size(280.0)
             .min_size(180.0)
             .show(ui, |ui| {
-                tree_panel::show(ui, &self.conn, &self.tree, &mut actions);
+                tree_panel::show(ui, &self.conn, &mut self.tree, &mut actions);
             });
 
         // The dock fills the remaining central space.
         let mut viewer = TabViewerCtx {
             conn: &self.conn,
+            tree: &self.tree,
+            dashboard: &mut self.dashboard,
             entities: &mut self.open_entities,
             peek_batch: self.config.ui.peek_batch,
             actions: &mut actions,

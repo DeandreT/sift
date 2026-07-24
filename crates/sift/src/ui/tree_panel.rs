@@ -7,12 +7,12 @@
 use sift_backend::EntityPath;
 use sift_mgmt::{MessageCountDetails, QueueInfo, RuleInfo, SubscriptionInfo, TopicInfo};
 
-use crate::state::{AppAction, ConnectionState, CreateKind, EntityTree, Loadable};
+use crate::state::{AppAction, ConnectionState, CreateKind, EntityTree, Loadable, TreeFilter};
 
 pub fn show(
     ui: &mut egui::Ui,
     conn: &ConnectionState,
-    tree: &EntityTree,
+    tree: &mut EntityTree,
     actions: &mut Vec<AppAction>,
 ) {
     match conn {
@@ -59,6 +59,8 @@ pub fn show(
                 subtitle.push_str(sku);
             }
             ui.label(egui::RichText::new(subtitle).weak().small());
+
+            filter_box(ui, &mut tree.filter);
             ui.separator();
 
             egui::ScrollArea::vertical()
@@ -69,6 +71,33 @@ pub fn show(
                 });
         }
     }
+}
+
+/// Filter text box with a clear button; focused on demand (Ctrl+F).
+fn filter_box(ui: &mut egui::Ui, filter: &mut TreeFilter) {
+    ui.horizontal(|ui| {
+        ui.label(egui_phosphor::regular::MAGNIFYING_GLASS);
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut filter.text)
+                .hint_text("Filter (Ctrl+F)")
+                .desired_width(f32::INFINITY),
+        );
+        if response.changed() {
+            filter.on_edit();
+        }
+        if filter.focus_requested {
+            response.request_focus();
+            filter.focus_requested = false;
+        }
+        if !filter.text.is_empty()
+            && ui
+                .add(egui::Button::new("✕").frame(false))
+                .on_hover_text("Clear filter")
+                .clicked()
+        {
+            filter.clear();
+        }
+    });
 }
 
 // ---- folders ----------------------------------------------------------------
@@ -88,10 +117,14 @@ fn queues_folder(ui: &mut egui::Ui, tree: &EntityTree, actions: &mut Vec<AppActi
             }
             Loadable::Failed(e) => failed_row(ui, e, AppAction::LoadQueues, actions),
             Loadable::Loaded(queues) => {
-                if queues.is_empty() {
+                let visible: Vec<&QueueInfo> = queues
+                    .iter()
+                    .filter(|q| tree.filter.matches(&q.properties.name))
+                    .collect();
+                if visible.is_empty() {
                     ui.label(egui::RichText::new("no queues").weak());
                 }
-                for queue in queues {
+                for queue in visible {
                     queue_row(ui, queue, actions);
                 }
             }
@@ -123,10 +156,12 @@ fn topics_folder(ui: &mut egui::Ui, tree: &EntityTree, actions: &mut Vec<AppActi
             }
             Loadable::Failed(e) => failed_row(ui, e, AppAction::LoadTopics, actions),
             Loadable::Loaded(topics) => {
-                if topics.is_empty() {
+                let visible: Vec<&TopicInfo> =
+                    topics.iter().filter(|t| topic_visible(t, tree)).collect();
+                if visible.is_empty() {
                     ui.label(egui::RichText::new("no topics").weak());
                 }
-                for topic in topics {
+                for topic in visible {
                     topic_node(ui, topic, tree, actions);
                 }
             }
@@ -177,28 +212,36 @@ fn topic_node(
         subs.map_or_else(|| format!(" ({})", topic.subscription_count), list_suffix)
     );
 
-    let header = egui::CollapsingHeader::new(title)
-        .id_salt(("topic", name))
-        .show(ui, |ui| match subs {
-            None => actions.push(AppAction::LoadSubscriptions(name.clone())),
-            Some(Loadable::NotLoaded) => {
-                actions.push(AppAction::LoadSubscriptions(name.clone()));
+    // With an active filter, expand so matching subscriptions are visible; a
+    // topic that matches by name shows all its subscriptions.
+    let topic_matches = tree.filter.matches(name);
+    let mut header = egui::CollapsingHeader::new(title).id_salt(("topic", name));
+    if tree.filter.is_active() {
+        header = header.open(Some(true));
+    }
+    let header = header.show(ui, |ui| match subs {
+        None | Some(Loadable::NotLoaded) => {
+            actions.push(AppAction::LoadSubscriptions(name.clone()));
+        }
+        Some(Loadable::Loading) => {
+            ui.spinner();
+        }
+        Some(Loadable::Failed(e)) => {
+            failed_row(ui, e, AppAction::LoadSubscriptions(name.clone()), actions);
+        }
+        Some(Loadable::Loaded(subscriptions)) => {
+            let visible: Vec<&SubscriptionInfo> = subscriptions
+                .iter()
+                .filter(|s| topic_matches || tree.filter.matches(&s.properties.name))
+                .collect();
+            if visible.is_empty() {
+                ui.label(egui::RichText::new("no subscriptions").weak());
             }
-            Some(Loadable::Loading) => {
-                ui.spinner();
+            for subscription in visible {
+                subscription_node(ui, subscription, tree, actions);
             }
-            Some(Loadable::Failed(e)) => {
-                failed_row(ui, e, AppAction::LoadSubscriptions(name.clone()), actions);
-            }
-            Some(Loadable::Loaded(subscriptions)) => {
-                if subscriptions.is_empty() {
-                    ui.label(egui::RichText::new("no subscriptions").weak());
-                }
-                for subscription in subscriptions {
-                    subscription_node(ui, subscription, tree, actions);
-                }
-            }
-        });
+        }
+    });
     header.header_response.context_menu(|ui| {
         if ui.button("Open").clicked() {
             actions.push(AppAction::OpenEntity(path.clone()));
@@ -375,5 +418,20 @@ fn list_suffix<T>(loadable: &Loadable<Vec<T>>) -> String {
     match loadable {
         Loadable::Loaded(items) => format!(" ({})", items.len()),
         _ => String::new(),
+    }
+}
+
+/// A topic shows when its own name matches, or (once its subscriptions are
+/// loaded) when any subscription matches. Unloaded subscriptions can't be
+/// tested, so the topic stays visible until they arrive.
+fn topic_visible(topic: &TopicInfo, tree: &EntityTree) -> bool {
+    if !tree.filter.is_active() || tree.filter.matches(&topic.properties.name) {
+        return true;
+    }
+    match tree.subscriptions.get(&topic.properties.name) {
+        Some(Loadable::Loaded(subs)) => {
+            subs.iter().any(|s| tree.filter.matches(&s.properties.name))
+        }
+        _ => true,
     }
 }

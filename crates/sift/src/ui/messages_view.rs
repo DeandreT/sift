@@ -155,6 +155,35 @@ fn toolbar(
                 });
             }
         }
+
+        // Bulk operations, pinned to the right.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let purge = egui::Button::new(
+                egui::RichText::new(format!("{} Purge", egui_phosphor::regular::TRASH))
+                    .color(ui.visuals().error_fg_color),
+            );
+            if ui
+                .add(purge)
+                .on_hover_text("Delete every message in this view")
+                .clicked()
+            {
+                actions.push(AppAction::RequestPurge(source.clone()));
+            }
+            if source.dead_letter
+                && ui
+                    .button(format!(
+                        "{} Resubmit all",
+                        egui_phosphor::regular::ARROW_U_UP_LEFT
+                    ))
+                    .on_hover_text("Move every dead-letter message back to the entity")
+                    .clicked()
+            {
+                actions.push(AppAction::ResubmitAll {
+                    source: source.clone(),
+                    target: send_target(source),
+                });
+            }
+        });
     });
 }
 

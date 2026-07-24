@@ -12,5 +12,5 @@ mod sb_runtime;
 pub use backend::{RepaintFn, spawn};
 pub use bridge::{
     BackendError, BackendHandle, Command, Disposition, EntityDescription, EntityInfo, EntityPath,
-    Event, MessageSource, MutationOp, NamespaceId, ReceiveMode, RequestId,
+    Event, MessageSource, MutationOp, NamespaceId, OpId, OpKind, OpSummary, ReceiveMode, RequestId,
 };

@@ -9,11 +9,20 @@ use sift_core::connection::NamespaceConnection;
 use sift_mgmt::ManagementClient;
 use tokio::sync::Mutex;
 
+use tokio_util::sync::CancellationToken;
+
 use crate::bridge::{
-    BackendError, BackendHandle, Command, EntityDescription, EntityInfo, EntityPath, Event,
-    MutationOp, NamespaceId, RequestId,
+    BackendError, BackendHandle, Command, Disposition, EntityDescription, EntityInfo, EntityPath,
+    Event, MessageSource, MutationOp, NamespaceId, OpId, OpKind, OpSummary, ReceiveMode, RequestId,
 };
 use crate::sb_runtime::SbRuntime;
+
+/// Batch size for purge/resubmit receive loops.
+const OP_BATCH: u32 = 100;
+/// Wait for each op batch; a full empty wait signals the queue is drained.
+const OP_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+/// Consecutive empty batches before an op concludes the source is drained.
+const OP_EMPTY_STREAK: u32 = 2;
 
 /// Called after every event so the UI repaints promptly; the GUI passes
 /// `egui::Context::request_repaint` without this crate depending on egui.
@@ -70,6 +79,8 @@ struct NamespaceState {
 #[derive(Default)]
 struct State {
     namespaces: HashMap<NamespaceId, NamespaceState>,
+    /// Cancellation handles for in-flight long-running operations.
+    ops: HashMap<OpId, CancellationToken>,
 }
 
 type SharedState = Arc<Mutex<State>>;
@@ -284,10 +295,151 @@ async fn run(mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Command>, sink: Ev
                     });
                 });
             }
+            Command::StartPurge { op, ns, source } => {
+                start_op(&sink, &state, ns, op, OpKind::Purge, source, None);
+            }
+            Command::StartResubmit {
+                op,
+                ns,
+                source,
+                target,
+            } => {
+                start_op(
+                    &sink,
+                    &state,
+                    ns,
+                    op,
+                    OpKind::Resubmit,
+                    source,
+                    Some(target),
+                );
+            }
+            Command::CancelOp(op) => {
+                if let Some(token) = state.lock().await.ops.get(&op) {
+                    tracing::info!("cancelling operation {op:?}");
+                    token.cancel();
+                }
+            }
             Command::Shutdown => break,
         }
     }
     tracing::debug!("backend runtime stopped");
+}
+
+/// Spawn a purge or resubmit operation on a dedicated AMQP connection (so a
+/// long drain never blocks the shared runtime's mutex), reporting progress and
+/// honoring cancellation.
+fn start_op(
+    sink: &EventSink,
+    state: &SharedState,
+    ns: NamespaceId,
+    op: OpId,
+    kind: OpKind,
+    source: MessageSource,
+    target: Option<EntityPath>,
+) {
+    let (sink, state) = (sink.clone(), Arc::clone(state));
+    let token = CancellationToken::new();
+
+    tokio::spawn(async move {
+        let conn = {
+            let mut guard = state.lock().await;
+            let Some(nss) = guard.namespaces.get(&ns) else {
+                sink.send(Event::OpFinished {
+                    op,
+                    result: Err(BackendError::new("not connected to this namespace")),
+                    cancelled: false,
+                });
+                return;
+            };
+            let conn = nss.conn.clone();
+            guard.ops.insert(op, token.clone());
+            conn
+        };
+
+        let target_label = source.to_string();
+        let result = run_op(&conn, op, kind, &source, target.as_ref(), &token, &sink).await;
+        let cancelled = token.is_cancelled();
+        state.lock().await.ops.remove(&op);
+
+        match &result {
+            Ok(summary) => tracing::info!(
+                "{} finished: {} messages from '{target_label}'{}",
+                kind.verb(),
+                summary.processed,
+                if cancelled { " (cancelled)" } else { "" }
+            ),
+            Err(e) => tracing::error!("{} of '{target_label}' failed: {e}", kind.verb()),
+        }
+        sink.send(Event::OpFinished {
+            op,
+            result,
+            cancelled,
+        });
+    });
+}
+
+async fn run_op(
+    conn: &NamespaceConnection,
+    op: OpId,
+    kind: OpKind,
+    source: &MessageSource,
+    target: Option<&EntityPath>,
+    token: &CancellationToken,
+    sink: &EventSink,
+) -> Result<OpSummary, BackendError> {
+    let mut rt = SbRuntime::connect(conn).await?;
+    let mut processed: u64 = 0;
+    let mut empty_streak = 0u32;
+    let target_label = source.to_string();
+
+    while empty_streak < OP_EMPTY_STREAK {
+        if token.is_cancelled() {
+            break;
+        }
+        // Purge consumes destructively; resubmit locks so a failed send leaves
+        // the message safely in the dead-letter queue.
+        let mode = match kind {
+            OpKind::Purge => ReceiveMode::ReceiveAndDelete,
+            OpKind::Resubmit => ReceiveMode::PeekLock,
+        };
+        let batch = tokio::select! {
+            () = token.cancelled() => break,
+            r = rt.receive(source, mode, OP_BATCH, OP_WAIT) => r?,
+        };
+        if batch.is_empty() {
+            empty_streak += 1;
+            continue;
+        }
+        empty_streak = 0;
+
+        if let (OpKind::Resubmit, Some(target)) = (kind, target) {
+            for message in &batch {
+                let Some(token) = &message.lock_token else {
+                    continue;
+                };
+                rt.send(target, vec![message.to_outbound()]).await?;
+                rt.settle(token, Disposition::Complete).await?;
+                processed += 1;
+            }
+        } else {
+            processed += batch.len() as u64;
+        }
+
+        sink.send(Event::OpProgress {
+            op,
+            kind,
+            done: processed,
+            target: target_label.clone(),
+        });
+    }
+
+    rt.shutdown().await;
+    Ok(OpSummary {
+        kind,
+        processed,
+        target: target_label,
+    })
 }
 
 /// Look up the namespace's management client and run `op` on a fresh task.

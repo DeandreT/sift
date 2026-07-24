@@ -1,86 +1,122 @@
-//! Modal dialogs: typed-name delete confirmation (the entity name must be
-//! typed back to arm the delete button) and entity creation forms.
+//! Modal dialogs: a typed-name confirmation guard (shared by delete and
+//! purge) and entity creation forms.
 
-use sift_backend::{EntityDescription, EntityPath};
+use sift_backend::{EntityDescription, EntityPath, MessageSource};
 use sift_mgmt::{
     QueueProperties, RuleFilter, RuleProperties, SubscriptionProperties, TopicProperties,
 };
 
 use crate::state::CreateKind;
 
-// ---- delete confirmation ----------------------------------------------------
+// ---- destructive-action confirmation ----------------------------------------
+
+/// What a confirmed dialog will do. Carries the payload the app needs.
+#[derive(Debug, Clone)]
+pub enum PendingConfirm {
+    Delete(EntityPath),
+    Purge(MessageSource),
+}
 
 #[derive(Debug)]
-pub struct ConfirmDeleteDialog {
-    pub path: EntityPath,
+pub struct ConfirmDialog {
+    pub action: PendingConfirm,
+    /// The entity name that must be typed back to arm the button.
+    pub name: String,
     pub typed: String,
     /// When the config disables the typed-name guard, a plain button suffices.
     pub require_typed_name: bool,
 }
 
-impl ConfirmDeleteDialog {
+impl ConfirmDialog {
     #[must_use]
-    pub fn new(path: EntityPath, require_typed_name: bool) -> Self {
+    pub fn new(action: PendingConfirm, require_typed_name: bool) -> Self {
+        let name = match &action {
+            PendingConfirm::Delete(path) => path.name().to_owned(),
+            PendingConfirm::Purge(source) => source.entity.name().to_owned(),
+        };
         Self {
-            path,
+            action,
+            name,
             typed: String::new(),
             require_typed_name,
+        }
+    }
+
+    fn heading(&self) -> String {
+        match &self.action {
+            PendingConfirm::Delete(path) => format!("Delete {}", path.kind()),
+            PendingConfirm::Purge(source) if source.dead_letter => {
+                "Purge dead-letter queue".to_owned()
+            }
+            PendingConfirm::Purge(_) => "Purge messages".to_owned(),
+        }
+    }
+
+    fn body(&self) -> String {
+        match &self.action {
+            PendingConfirm::Delete(path) => {
+                format!("This permanently deletes '{path}' and everything in it.")
+            }
+            PendingConfirm::Purge(source) => {
+                format!("This permanently deletes every message in '{source}'.")
+            }
+        }
+    }
+
+    fn confirm_label(&self) -> &'static str {
+        match &self.action {
+            PendingConfirm::Delete(_) => "Delete",
+            PendingConfirm::Purge(_) => "Purge",
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConfirmDeleteAction {
-    Delete,
+pub enum ConfirmAction {
+    Confirm,
     Close,
 }
 
-pub fn show_confirm_delete(
-    ctx: &egui::Context,
-    dialog: &mut ConfirmDeleteDialog,
-) -> Option<ConfirmDeleteAction> {
+pub fn show_confirm(ctx: &egui::Context, dialog: &mut ConfirmDialog) -> Option<ConfirmAction> {
     let mut action = None;
 
-    let modal = egui::Modal::new(egui::Id::new("confirm-delete")).show(ctx, |ui| {
+    let modal = egui::Modal::new(egui::Id::new("confirm-destructive")).show(ctx, |ui| {
         ui.set_width(420.0);
-        ui.heading(format!("Delete {}", dialog.path.kind()));
+        ui.heading(dialog.heading());
         ui.add_space(8.0);
-        ui.label(format!(
-            "This permanently deletes '{}' and everything in it.",
-            dialog.path
-        ));
+        ui.label(dialog.body());
 
-        let name = dialog.path.name().to_owned();
         let confirmed = if dialog.require_typed_name {
             ui.add_space(8.0);
-            ui.label(format!("Type the {} name to confirm:", dialog.path.kind()));
+            ui.label(format!("Type '{}' to confirm:", dialog.name));
             ui.add(
                 egui::TextEdit::singleline(&mut dialog.typed)
-                    .hint_text(&name)
+                    .hint_text(&dialog.name)
                     .desired_width(f32::INFINITY),
             );
-            dialog.typed.trim().eq_ignore_ascii_case(&name)
+            dialog.typed.trim().eq_ignore_ascii_case(&dialog.name)
         } else {
             true
         };
 
         ui.add_space(12.0);
         ui.horizontal(|ui| {
-            let delete =
-                egui::Button::new(egui::RichText::new("Delete").color(ui.visuals().error_fg_color));
-            if ui.add_enabled(confirmed, delete).clicked() {
-                action = Some(ConfirmDeleteAction::Delete);
+            let confirm = egui::Button::new(
+                egui::RichText::new(dialog.confirm_label()).color(ui.visuals().error_fg_color),
+            );
+            if ui.add_enabled(confirmed, confirm).clicked() {
+                action = Some(ConfirmAction::Confirm);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Cancel").clicked() {
-                    action = Some(ConfirmDeleteAction::Close);
+                    action = Some(ConfirmAction::Close);
                 }
             });
         });
     });
 
     if modal.should_close() && action.is_none() {
-        action = Some(ConfirmDeleteAction::Close);
+        action = Some(ConfirmAction::Close);
     }
     action
 }

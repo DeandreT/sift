@@ -8,7 +8,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use sift_backend::{Command, Disposition, EntityPath, Event, MessageSource, ReceiveMode};
+use sift_backend::{
+    Command, Disposition, EntityPath, Event, MessageSource, OpSummary, ReceiveMode,
+};
 use sift_core::config::NamespaceProfile;
 use sift_core::connection::NamespaceConnection;
 use sift_core::message::OutboundMessage;
@@ -258,4 +260,163 @@ fn live_messaging_round_trip() {
     rt.block_on(mgmt.delete_queue(&queue_name))
         .expect("delete scratch queue");
     eprintln!("messaging round trip OK on '{queue_name}'");
+}
+
+#[allow(clippy::too_many_lines)] // a linear end-to-end scenario reads best in one function
+#[test]
+fn live_purge_and_resubmit() {
+    let Ok(connection_string) = std::env::var("SIFT_TEST_SB_CONNECTION_STRING") else {
+        eprintln!("skipped: SIFT_TEST_SB_CONNECTION_STRING not set");
+        return;
+    };
+    if std::env::var("SIFT_TEST_SB_MUTATE").as_deref() != Ok("1") {
+        eprintln!("skipped: SIFT_TEST_SB_MUTATE != 1");
+        return;
+    }
+
+    let conn = NamespaceConnection::parse(&connection_string).expect("valid connection string");
+    let mgmt = ManagementClient::new(&conn).expect("management client");
+    let queue_name = format!("sift-test-op-{}", uuid::Uuid::new_v4());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime for mgmt calls");
+    rt.block_on(mgmt.create_queue(&QueueProperties {
+        name: queue_name.clone(),
+        ..QueueProperties::default()
+    }))
+    .expect("create scratch queue");
+
+    let (backend, events) = sift_backend::spawn(Arc::new(|| {}));
+    let profile = NamespaceProfile::new_connection_string("live-op-test".into());
+    let ns = profile.id;
+    backend.send(Command::Connect {
+        req: backend.next_request(),
+        profile,
+        secret: SecretString::from(connection_string.as_str()),
+    });
+    recv_until(&events, |e| match e {
+        Event::Connected { result, .. } => Some(result.expect("connect")),
+        _ => None,
+    });
+
+    let queue_path = EntityPath::Queue(queue_name.clone());
+    let main = MessageSource {
+        entity: queue_path.clone(),
+        dead_letter: false,
+    };
+    let dlq = MessageSource {
+        entity: queue_path.clone(),
+        dead_letter: true,
+    };
+    let send_n = |n: usize| {
+        backend.send(Command::SendMessages {
+            req: backend.next_request(),
+            ns,
+            target: queue_path.clone(),
+            messages: (0..n)
+                .map(|i| OutboundMessage {
+                    body: format!("msg {i}"),
+                    ..OutboundMessage::default()
+                })
+                .collect(),
+        });
+        recv_until(&events, |e| match e {
+            Event::Sent { result, .. } => {
+                let _: () = result.expect("send");
+                Some(())
+            }
+            _ => None,
+        });
+    };
+    let op_summary = |events: &crossbeam_channel::Receiver<Event>| -> Result<OpSummary, String> {
+        recv_until(events, |e| match e {
+            Event::OpFinished { result, .. } => Some(result.map_err(|e| e.message)),
+            _ => None,
+        })
+    };
+
+    // Purge: send 5, drain them all.
+    send_n(5);
+    backend.send(Command::StartPurge {
+        op: backend.next_op(),
+        ns,
+        source: main.clone(),
+    });
+    let purged = op_summary(&events).expect("purge");
+    assert_eq!(purged.processed, 5);
+
+    // Resubmit: send 3, dead-letter each, then move them back to the queue.
+    send_n(3);
+    let mut dead_lettered = 0;
+    while dead_lettered < 3 {
+        backend.send(Command::ReceiveMessages {
+            req: backend.next_request(),
+            ns,
+            source: main.clone(),
+            mode: ReceiveMode::PeekLock,
+            count: 3,
+        });
+        let batch = recv_until(&events, |e| match e {
+            Event::Messages {
+                received: true,
+                result,
+                ..
+            } => Some(result.expect("receive")),
+            _ => None,
+        });
+        for message in batch {
+            backend.send(Command::SettleMessage {
+                req: backend.next_request(),
+                ns,
+                source: main.clone(),
+                lock_token: message.lock_token.clone().expect("lock token"),
+                disposition: Disposition::DeadLetter {
+                    reason: Some("sift-op-test".into()),
+                    description: None,
+                },
+            });
+            recv_until(&events, |e| match e {
+                Event::Settled { result, .. } => {
+                    let _: () = result.expect("dead-letter");
+                    Some(())
+                }
+                _ => None,
+            });
+            dead_lettered += 1;
+        }
+    }
+
+    backend.send(Command::StartResubmit {
+        op: backend.next_op(),
+        ns,
+        source: dlq,
+        target: queue_path.clone(),
+    });
+    let resubmitted = op_summary(&events).expect("resubmit");
+    assert_eq!(resubmitted.processed, 3);
+
+    // The 3 resubmitted messages are back on the main queue (fresh, no DLQ mark).
+    backend.send(Command::PeekMessages {
+        req: backend.next_request(),
+        ns,
+        source: main,
+        from_seq: None,
+        count: 10,
+    });
+    let back = recv_until(&events, |e| match e {
+        Event::Messages {
+            received: false,
+            result,
+            ..
+        } => Some(result.expect("peek after resubmit")),
+        _ => None,
+    });
+    assert_eq!(back.len(), 3);
+    assert!(back.iter().all(|m| m.dead_letter_reason.is_none()));
+
+    backend.send(Command::Disconnect { ns });
+    rt.block_on(mgmt.delete_queue(&queue_name))
+        .expect("delete scratch queue");
+    eprintln!("purge + resubmit OK on '{queue_name}'");
 }
