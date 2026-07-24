@@ -75,6 +75,28 @@ impl DecodedBody {
     }
 }
 
+/// Interpret `text` as base64 and decode it, then classify the result like
+/// any other body (JSON/XML/text/binary). Accepts standard and URL-safe
+/// alphabets and ignores surrounding whitespace/newlines.
+pub fn decode_base64(text: &str) -> Result<DecodedBody, String> {
+    use base64::Engine as _;
+
+    let trimmed: String = text.split_whitespace().collect();
+    if trimmed.is_empty() {
+        return Err("nothing to decode".to_owned());
+    }
+    let engines = [
+        base64::engine::general_purpose::STANDARD,
+        base64::engine::general_purpose::URL_SAFE,
+    ];
+    for engine in engines {
+        if let Ok(bytes) = engine.decode(trimmed.as_bytes()) {
+            return Ok(decode(bytes));
+        }
+    }
+    Err("not valid base64".to_owned())
+}
+
 /// Decode raw `Data`-section bytes.
 #[must_use]
 pub fn decode(bytes: Vec<u8>) -> DecodedBody {
@@ -235,6 +257,21 @@ mod tests {
         assert_eq!(decoded.format, BodyFormat::Json);
         // Raw bytes stay compressed for fidelity.
         assert_eq!(decoded.bytes, gz);
+    }
+
+    #[test]
+    fn base64_decodes_and_reclassifies() {
+        // base64 of {"a":1}
+        let decoded = decode_base64("eyJhIjoxfQ==").unwrap();
+        assert_eq!(decoded.format, BodyFormat::Json);
+        assert!(decoded.text.unwrap().contains("\"a\": 1"));
+    }
+
+    #[test]
+    fn base64_tolerates_whitespace_and_rejects_garbage() {
+        assert!(decode_base64("eyJhIjox\n  fQ==").is_ok());
+        assert!(decode_base64("not base64!!!").is_err());
+        assert!(decode_base64("   ").is_err());
     }
 
     #[test]

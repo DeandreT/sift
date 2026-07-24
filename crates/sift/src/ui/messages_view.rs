@@ -353,6 +353,7 @@ fn message_table(ui: &mut egui::Ui, view: &mut MessagesView, height: f32) {
     }
 }
 
+#[allow(clippy::too_many_lines)] // header + split panels read best in one function
 fn message_viewer(ui: &mut egui::Ui, view: &mut MessagesView) {
     let Some(index) = view.selected else { return };
     let Some(message) = view.rows.get(index) else {
@@ -360,12 +361,32 @@ fn message_viewer(ui: &mut egui::Ui, view: &mut MessagesView) {
         return;
     };
     // Clone the light-weight parts we need so the view can stay borrowed mut.
-    let body = message.body.clone();
+    let raw_body = message.body.clone();
     let message = message.clone();
+
+    // Optionally reinterpret the body as base64; fall back with a note.
+    let base64_error = if view.show_base64 {
+        raw_body
+            .text
+            .as_deref()
+            .map(sift_core::body::decode_base64)
+            .and_then(Result::err)
+    } else {
+        None
+    };
+    let body = if view.show_base64 {
+        raw_body
+            .text
+            .as_deref()
+            .and_then(|t| sift_core::body::decode_base64(t).ok())
+            .unwrap_or_else(|| raw_body.clone())
+    } else {
+        raw_body.clone()
+    };
 
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(body.format.label()).strong());
-        if body.gzipped {
+        if raw_body.gzipped {
             ui.label(egui::RichText::new("gzip").weak());
         }
         ui.label(egui::RichText::new(format_size(body.size())).weak());
@@ -385,49 +406,70 @@ fn message_viewer(ui: &mut egui::Ui, view: &mut MessagesView) {
                 ui.ctx().copy_text(text);
             }
             ui.checkbox(&mut view.show_hex, "Hex");
+            ui.checkbox(&mut view.show_base64, "Base64")
+                .on_hover_text("Interpret the body as base64 and decode it");
         });
     });
+    if let Some(err) = base64_error {
+        ui.colored_label(ui.visuals().warn_fg_color, format!("Base64: {err}"));
+    }
 
-    egui::ScrollArea::vertical()
-        .id_salt("message-viewer")
-        .auto_shrink([false, false])
+    // Body on the left, properties on the right (resizable split).
+    egui::Panel::right("message-props")
+        .resizable(true)
+        .default_size(280.0)
         .show(ui, |ui| {
-            if view.show_hex || body.text.is_none() {
-                ui.monospace(hex_dump(&body.bytes, 16 * 1024));
-            } else if let Some(text) = &body.text {
-                let language = match body.format {
-                    BodyFormat::Json => "json",
-                    BodyFormat::Xml => "xml",
-                    _ => "txt",
-                };
-                let theme = egui_extras::syntax_highlighting::CodeTheme::from_style(ui.style());
-                egui_extras::syntax_highlighting::code_view_ui(ui, &theme, text, language);
-            }
-
-            ui.add_space(8.0);
-            egui::CollapsingHeader::new("System properties")
-                .default_open(false)
-                .show(ui, |ui| system_properties(ui, &message));
-            if !message.application_properties.is_empty() {
-                egui::CollapsingHeader::new(format!(
-                    "Custom properties ({})",
-                    message.application_properties.len()
-                ))
-                .default_open(true)
+            egui::ScrollArea::vertical()
+                .id_salt("message-props-scroll")
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    egui::Grid::new("custom-props")
-                        .num_columns(2)
-                        .striped(true)
+                    egui::CollapsingHeader::new("System properties")
+                        .default_open(true)
+                        .show(ui, |ui| system_properties(ui, &message));
+                    if !message.application_properties.is_empty() {
+                        egui::CollapsingHeader::new(format!(
+                            "Custom properties ({})",
+                            message.application_properties.len()
+                        ))
+                        .default_open(true)
                         .show(ui, |ui| {
-                            for (key, value) in &message.application_properties {
-                                ui.label(egui::RichText::new(key).weak());
-                                ui.monospace(value);
-                                ui.end_row();
-                            }
+                            egui::Grid::new("custom-props")
+                                .num_columns(2)
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    for (key, value) in &message.application_properties {
+                                        ui.label(egui::RichText::new(key).weak());
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(value).monospace(),
+                                            )
+                                            .wrap(),
+                                        );
+                                        ui.end_row();
+                                    }
+                                });
                         });
+                    }
                 });
-            }
         });
+    egui::CentralPanel::default().show(ui, |ui| {
+        egui::ScrollArea::vertical()
+            .id_salt("message-body-scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if view.show_hex || body.text.is_none() {
+                    ui.monospace(hex_dump(&body.bytes, 16 * 1024));
+                } else if let Some(text) = &body.text {
+                    let language = match body.format {
+                        BodyFormat::Json => "json",
+                        BodyFormat::Xml => "xml",
+                        _ => "txt",
+                    };
+                    let theme = egui_extras::syntax_highlighting::CodeTheme::from_style(ui.style());
+                    egui_extras::syntax_highlighting::code_view_ui(ui, &theme, text, language);
+                }
+            });
+    });
 }
 
 fn system_properties(ui: &mut egui::Ui, m: &SiftMessage) {

@@ -237,6 +237,8 @@ pub struct MessagesView {
     pub fetch_count: u32,
     /// Body viewer: show hex instead of text.
     pub show_hex: bool,
+    /// Body viewer: interpret the body as base64 and show the decoded content.
+    pub show_base64: bool,
     /// Sequence numbers of messages deferred from this view, so they can be
     /// retrieved later (the service returns nothing on defer).
     pub deferred_seqs: Vec<i64>,
@@ -252,6 +254,7 @@ impl MessagesView {
             error: None,
             fetch_count,
             show_hex: false,
+            show_base64: false,
             deferred_seqs: Vec::new(),
         }
     }
