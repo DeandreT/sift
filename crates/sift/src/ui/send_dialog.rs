@@ -143,13 +143,21 @@ pub fn show(ctx: &egui::Context, dialog: &mut SendDialog) -> Option<SendAction> 
                 }
             });
         } else {
-            ui.add(
-                egui::TextEdit::multiline(&mut dialog.body)
-                    .code_editor()
-                    .hint_text("message body")
-                    .desired_rows(8)
-                    .desired_width(f32::INFINITY),
-            );
+            // Cap the editor height so a large payload scrolls in place
+            // rather than growing the dialog off-screen.
+            let max_body = (ctx.content_rect().height() * 0.4).clamp(140.0, 420.0);
+            egui::ScrollArea::vertical()
+                .id_salt("send-body")
+                .max_height(max_body)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut dialog.body)
+                            .code_editor()
+                            .hint_text("message body")
+                            .desired_rows(8)
+                            .desired_width(f32::INFINITY),
+                    );
+                });
         }
         ui.add_space(8.0);
 

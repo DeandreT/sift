@@ -249,6 +249,7 @@ fn cell(ui: &mut egui::Ui, text: egui::RichText) -> egui::Response {
     ui.add(egui::Label::new(text).truncate().selectable(false))
 }
 
+#[allow(clippy::too_many_lines)] // one column definition + cell per grid column
 fn message_table(ui: &mut egui::Ui, view: &mut MessagesView, height: f32) {
     let dlq_column = view.rows.iter().any(|m| m.dead_letter_reason.is_some());
     let mut builder = TableBuilder::new(ui)
