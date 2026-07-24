@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use sift_backend::{EntityPath, MessageSource};
 
+use crate::icons::{Icon, icon};
 use crate::state::{
     AppAction, ConnectionState, DashboardState, EntityPage, EntityTabState, EntityTree, Loadable,
 };
@@ -70,8 +71,7 @@ impl TabViewerCtx<'_> {
             ui.add_space(16.0);
             match self.conn {
                 ConnectionState::Disconnected => {
-                    let label =
-                        format!("{} Connect to a namespace…", egui_phosphor::regular::PLUGS);
+                    let label = format!("{} Connect to a namespace…", icon(Icon::Plug));
                     if ui.button(label).clicked() {
                         self.actions.push(AppAction::OpenConnectDialog);
                     }
@@ -152,17 +152,14 @@ pub fn render_entity(
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if popped {
                 if ui
-                    .button(format!("{} Dock", egui_phosphor::regular::ARROW_LINE_DOWN))
+                    .button(format!("{} Dock", icon(Icon::ArrowDownToLine)))
                     .on_hover_text("Return this window to the main frame")
                     .clicked()
                 {
                     actions.push(AppAction::DockEntity(path.clone()));
                 }
             } else if ui
-                .button(format!(
-                    "{} Pop out",
-                    egui_phosphor::regular::ARROW_SQUARE_OUT
-                ))
+                .button(format!("{} Pop out", icon(Icon::ExternalLink)))
                 .on_hover_text("Detach into a separate window")
                 .clicked()
             {

@@ -23,10 +23,12 @@ sift-mgmt = { path = "crates/mgmt" }
 # GUI — egui-family crates move in lockstep; upgrade them together in one change.
 eframe = "0.35"
 egui = "0.35"
-egui-phosphor = "0.13"
 egui-toast = "0.21"
 egui_dock = "0.20"
 egui_extras = "0.35"
+
+# Icon font (bundles the Lucide TTF).
+lucide-icons = "1.26"
 
 # Azure Service Bus AMQP runtime (community crate; no official SDK exists)
 azservicebus = { version = "0.25", default-features = false, features = ["rustls"] }

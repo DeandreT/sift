@@ -6,6 +6,7 @@ use sift_backend::{Disposition, MessageSource, ReceiveMode};
 use sift_core::body::{BodyFormat, hex_dump};
 use sift_core::message::{MessageState, SiftMessage};
 
+use crate::icons::{Icon, icon};
 use crate::state::{AppAction, MessagesView};
 
 pub fn show(
@@ -50,7 +51,7 @@ fn toolbar(
         if view.loading {
             ui.spinner();
         } else if ui
-            .button(format!("{} Peek", egui_phosphor::regular::MAGNIFYING_GLASS))
+            .button(format!("{} Peek", icon(Icon::Search)))
             .on_hover_text("Browse without consuming, from the front")
             .clicked()
         {
@@ -79,29 +80,26 @@ fn toolbar(
                 .prefix("count: "),
         );
 
-        ui.menu_button(
-            format!("{} Receive", egui_phosphor::regular::DOWNLOAD_SIMPLE),
-            |ui| {
-                if ui.button("Receive with lock (settle afterwards)").clicked() {
-                    actions.push(AppAction::ReceiveMessages {
-                        source: source.clone(),
-                        mode: ReceiveMode::PeekLock,
-                        count: view.fetch_count,
-                    });
-                    ui.close();
-                }
-                let destructive = egui::RichText::new("Receive and delete (destructive)")
-                    .color(ui.visuals().error_fg_color);
-                if ui.button(destructive).clicked() {
-                    actions.push(AppAction::ReceiveMessages {
-                        source: source.clone(),
-                        mode: ReceiveMode::ReceiveAndDelete,
-                        count: view.fetch_count,
-                    });
-                    ui.close();
-                }
-            },
-        );
+        ui.menu_button(format!("{} Receive", icon(Icon::Download)), |ui| {
+            if ui.button("Receive with lock (settle afterwards)").clicked() {
+                actions.push(AppAction::ReceiveMessages {
+                    source: source.clone(),
+                    mode: ReceiveMode::PeekLock,
+                    count: view.fetch_count,
+                });
+                ui.close();
+            }
+            let destructive = egui::RichText::new("Receive and delete (destructive)")
+                .color(ui.visuals().error_fg_color);
+            if ui.button(destructive).clicked() {
+                actions.push(AppAction::ReceiveMessages {
+                    source: source.clone(),
+                    mode: ReceiveMode::ReceiveAndDelete,
+                    count: view.fetch_count,
+                });
+                ui.close();
+            }
+        });
 
         // Settlement actions for the selected locked message.
         let selected = view
@@ -168,7 +166,7 @@ fn toolbar(
             if ui
                 .button(format!(
                     "{} Retrieve deferred ({})",
-                    egui_phosphor::regular::TRAY_ARROW_UP,
+                    icon(Icon::ArchiveRestore),
                     view.deferred_seqs.len()
                 ))
                 .clicked()
@@ -185,10 +183,7 @@ fn toolbar(
         if let Some(message) = view.selected_message() {
             ui.separator();
             if ui
-                .button(format!(
-                    "{} Resend…",
-                    egui_phosphor::regular::PAPER_PLANE_TILT
-                ))
+                .button(format!("{} Resend…", icon(Icon::Send)))
                 .on_hover_text("Compose a new message from this one")
                 .clicked()
             {
@@ -203,7 +198,7 @@ fn toolbar(
         // Bulk operations, pinned to the right.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let purge = egui::Button::new(
-                egui::RichText::new(format!("{} Purge", egui_phosphor::regular::TRASH))
+                egui::RichText::new(format!("{} Purge", icon(Icon::Trash2)))
                     .color(ui.visuals().error_fg_color),
             );
             if ui
@@ -215,10 +210,7 @@ fn toolbar(
             }
             if source.dead_letter
                 && ui
-                    .button(format!(
-                        "{} Resubmit all",
-                        egui_phosphor::regular::ARROW_U_UP_LEFT
-                    ))
+                    .button(format!("{} Resubmit all", icon(Icon::Undo2)))
                     .on_hover_text("Move every dead-letter message back to the entity")
                     .clicked()
             {
@@ -277,7 +269,7 @@ fn message_table(ui: &mut egui::Ui, view: &mut MessagesView, height: f32) {
                 "Subject",
                 "Enqueued (UTC)",
                 "Size",
-                "×",
+                "Dlv",
             ] {
                 header.col(|ui| {
                     ui.label(egui::RichText::new(title).strong());
@@ -383,7 +375,7 @@ fn message_viewer(ui: &mut egui::Ui, view: &mut MessagesView) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // One-click copy of the (decoded) body.
             if ui
-                .button(format!("{} Copy body", egui_phosphor::regular::COPY))
+                .button(format!("{} Copy body", icon(Icon::Copy)))
                 .clicked()
             {
                 let text = body

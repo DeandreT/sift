@@ -6,6 +6,8 @@
 use sift_core::config::AppConfig;
 use uuid::Uuid;
 
+use crate::icons::{Icon, icon};
+
 /// State of the open dialog (the dialog is open iff the app holds `Some`).
 #[derive(Debug, Default)]
 pub struct ConnectDialog {
@@ -121,7 +123,7 @@ pub fn show(
         ui.add_space(12.0);
 
         ui.horizontal(|ui| {
-            let connect = format!("{} Connect", egui_phosphor::regular::PLUGS);
+            let connect = format!("{} Connect", icon(Icon::Plug));
             if ui.button(connect).clicked() {
                 action = Some(DialogAction::Connect);
             }

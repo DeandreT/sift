@@ -4,6 +4,7 @@
 
 use sift_backend::MessageSource;
 
+use crate::icons::{Icon, icon};
 use crate::state::{AppAction, SessionsView};
 
 #[allow(clippy::too_many_lines)] // toolbar + state view + message list read best together
@@ -17,10 +18,7 @@ pub fn show(
         if view.loading {
             ui.spinner();
         } else if ui
-            .button(format!(
-                "{} Accept next session",
-                egui_phosphor::regular::ENVELOPE_SIMPLE_OPEN
-            ))
+            .button(format!("{} Accept next session", icon(Icon::MailOpen)))
             .on_hover_text("Accept the next available session and peek its messages")
             .clicked()
         {
@@ -72,7 +70,7 @@ pub fn show(
         ui.label("Session:");
         ui.monospace(&snapshot.session_id);
         if ui
-            .small_button(egui_phosphor::regular::COPY)
+            .small_button(icon(Icon::Copy))
             .on_hover_text("Copy id")
             .clicked()
         {

@@ -6,6 +6,7 @@ use egui_extras::{Column, TableBuilder};
 use sift_backend::EntityPath;
 use sift_mgmt::MessageCountDetails;
 
+use crate::icons::{Icon, icon};
 use crate::state::{AppAction, AutoRefresh, DashboardState, EntityTree, Loadable};
 
 struct Row {
@@ -24,10 +25,7 @@ pub fn show(
 ) {
     ui.horizontal(|ui| {
         if ui
-            .button(format!(
-                "{} Refresh",
-                egui_phosphor::regular::ARROWS_CLOCKWISE
-            ))
+            .button(format!("{} Refresh", icon(Icon::RefreshCw)))
             .clicked()
         {
             actions.push(AppAction::RefreshDashboard);

@@ -10,6 +10,7 @@ use sift_mgmt::{
     SubscriptionInfo, TopicInfo, is_unlimited,
 };
 
+use crate::icons::{Icon, icon};
 use crate::state::AppAction;
 
 pub fn show(ui: &mut egui::Ui, info: &EntityInfo, actions: &mut Vec<AppAction>) {
@@ -193,21 +194,13 @@ fn header(ui: &mut egui::Ui, path: &EntityPath, info: &EntityInfo, actions: &mut
                 actions.push(AppAction::RequestDelete(path.clone()));
             }
             if ui
-                .button(format!(
-                    "{} Refresh",
-                    egui_phosphor::regular::ARROWS_CLOCKWISE
-                ))
+                .button(format!("{} Refresh", icon(Icon::RefreshCw)))
                 .clicked()
             {
                 actions.push(AppAction::RefreshEntity(path.clone()));
             }
             if matches!(path, EntityPath::Queue(_) | EntityPath::Topic(_))
-                && ui
-                    .button(format!(
-                        "{} Send…",
-                        egui_phosphor::regular::PAPER_PLANE_TILT
-                    ))
-                    .clicked()
+                && ui.button(format!("{} Send…", icon(Icon::Send))).clicked()
             {
                 actions.push(AppAction::OpenSendDialog {
                     target: path.clone(),

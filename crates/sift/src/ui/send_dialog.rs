@@ -3,6 +3,8 @@
 use sift_backend::EntityPath;
 use sift_core::message::OutboundMessage;
 
+use crate::icons::{Icon, icon};
+
 #[derive(Debug)]
 pub struct SendDialog {
     pub target: EntityPath,
@@ -216,7 +218,7 @@ pub fn show(ctx: &egui::Context, dialog: &mut SendDialog) -> Option<SendAction> 
                         .hint_text("value")
                         .desired_width(240.0),
                 );
-                if ui.small_button("✕").clicked() {
+                if ui.small_button(icon(Icon::X)).clicked() {
                     remove = Some(i);
                 }
             });
@@ -235,7 +237,7 @@ pub fn show(ctx: &egui::Context, dialog: &mut SendDialog) -> Option<SendAction> 
         ui.add_space(12.0);
 
         ui.horizontal(|ui| {
-            let send = format!("{} Send", egui_phosphor::regular::PAPER_PLANE_TILT);
+            let send = format!("{} Send", icon(Icon::Send));
             if ui.button(send).clicked() {
                 action = Some(SendAction::Send);
             }

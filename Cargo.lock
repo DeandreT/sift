@@ -1230,15 +1230,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "egui-phosphor"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "249826f9529c1757d71dbbb3a22ec101b21110ab663c45fb771c2b86121379e4"
-dependencies = [
- "egui",
-]
-
-[[package]]
 name = "egui-toast"
 version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2670,6 +2661,12 @@ name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
+
+[[package]]
+name = "lucide-icons"
+version = "1.26.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cec88890b8b4cdff1603aa5c89ab1d3d006311c4893ee94d1f7b0651264d1c78"
 
 [[package]]
 name = "matchers"
@@ -4464,10 +4461,10 @@ dependencies = [
  "crossbeam-channel",
  "eframe",
  "egui",
- "egui-phosphor",
  "egui-toast",
  "egui_dock",
  "egui_extras",
+ "lucide-icons",
  "rfd",
  "serde",
  "sift-backend",

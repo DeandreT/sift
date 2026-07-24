@@ -7,6 +7,7 @@
 use sift_backend::EntityPath;
 use sift_mgmt::{MessageCountDetails, QueueInfo, RuleInfo, SubscriptionInfo, TopicInfo};
 
+use crate::icons::{Icon, icon};
 use crate::state::{AppAction, ConnectionState, CreateKind, EntityTree, Loadable, TreeFilter};
 
 pub fn show(
@@ -21,7 +22,7 @@ pub fn show(
             ui.vertical_centered(|ui| {
                 ui.label(egui::RichText::new("Not connected").weak());
                 ui.add_space(4.0);
-                let label = format!("{} Connect…", egui_phosphor::regular::PLUGS);
+                let label = format!("{} Connect…", icon(Icon::Plug));
                 if ui.button(label).clicked() {
                     actions.push(AppAction::OpenConnectDialog);
                 }
@@ -39,14 +40,14 @@ pub fn show(
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(name).strong());
                 if ui
-                    .small_button(egui_phosphor::regular::ARROWS_CLOCKWISE)
+                    .small_button(icon(Icon::RefreshCw))
                     .on_hover_text("Refresh all")
                     .clicked()
                 {
                     actions.push(AppAction::RefreshTree);
                 }
                 if ui
-                    .small_button(egui_phosphor::regular::PLUGS)
+                    .small_button(icon(Icon::Unplug))
                     .on_hover_text("Disconnect")
                     .clicked()
                 {
@@ -76,7 +77,7 @@ pub fn show(
 /// Filter text box with a clear button; focused on demand (Ctrl+F).
 fn filter_box(ui: &mut egui::Ui, filter: &mut TreeFilter) {
     ui.horizontal(|ui| {
-        ui.label(egui_phosphor::regular::MAGNIFYING_GLASS);
+        ui.label(icon(Icon::Search));
         let show_clear = !filter.text.is_empty();
 
         // Give the field an explicit finite width. Using `desired_width` of
@@ -97,7 +98,7 @@ fn filter_box(ui: &mut egui::Ui, filter: &mut TreeFilter) {
         }
         if show_clear
             && ui
-                .add(egui::Button::new("✕").frame(false))
+                .add(egui::Button::new(icon(Icon::X)).frame(false))
                 .on_hover_text("Clear filter")
                 .clicked()
         {
@@ -109,11 +110,7 @@ fn filter_box(ui: &mut egui::Ui, filter: &mut TreeFilter) {
 // ---- folders ----------------------------------------------------------------
 
 fn queues_folder(ui: &mut egui::Ui, tree: &EntityTree, actions: &mut Vec<AppAction>) {
-    let title = format!(
-        "{} Queues{}",
-        egui_phosphor::regular::TRAY,
-        list_suffix(&tree.queues)
-    );
+    let title = format!("{} Queues{}", icon(Icon::Inbox), list_suffix(&tree.queues));
     let header = egui::CollapsingHeader::new(title)
         .id_salt("queues-folder")
         .show(ui, |ui| match &tree.queues {
@@ -148,11 +145,7 @@ fn queues_folder(ui: &mut egui::Ui, tree: &EntityTree, actions: &mut Vec<AppActi
 }
 
 fn topics_folder(ui: &mut egui::Ui, tree: &EntityTree, actions: &mut Vec<AppAction>) {
-    let title = format!(
-        "{} Topics{}",
-        egui_phosphor::regular::BROADCAST,
-        list_suffix(&tree.topics)
-    );
+    let title = format!("{} Topics{}", icon(Icon::Radio), list_suffix(&tree.topics));
     let header = egui::CollapsingHeader::new(title)
         .id_salt("topics-folder")
         .show(ui, |ui| match &tree.topics {
@@ -190,7 +183,7 @@ fn queue_row(ui: &mut egui::Ui, queue: &QueueInfo, actions: &mut Vec<AppAction>)
     let path = EntityPath::Queue(queue.properties.name.clone());
     let label = entity_label(
         ui,
-        egui_phosphor::regular::TRAY,
+        &icon(Icon::Inbox),
         &queue.properties.name,
         Some(&queue.runtime.count_details),
     );
@@ -214,7 +207,7 @@ fn topic_node(
     let subs = tree.subscriptions.get(name);
     let title = format!(
         "{} {name}{}",
-        egui_phosphor::regular::BROADCAST,
+        icon(Icon::Radio),
         subs.map_or_else(|| format!(" ({})", topic.subscription_count), list_suffix)
     );
 
@@ -288,7 +281,7 @@ fn subscription_node(
 
     let label = entity_label(
         ui,
-        egui_phosphor::regular::ENVELOPE,
+        &icon(Icon::Mail),
         &name,
         Some(&subscription.runtime.count_details),
     );
@@ -357,11 +350,7 @@ fn rule_row(ui: &mut egui::Ui, rule: &RuleInfo, actions: &mut Vec<AppAction>) {
         subscription: rule.properties.subscription.clone(),
         name: rule.properties.name.clone(),
     };
-    let label = format!(
-        "{} {}",
-        egui_phosphor::regular::FUNNEL,
-        rule.properties.name
-    );
+    let label = format!("{} {}", icon(Icon::Filter), rule.properties.name);
     let response = ui
         .selectable_label(false, label)
         .on_hover_text(rule.properties.filter.summary());
@@ -386,14 +375,14 @@ fn rule_row(ui: &mut egui::Ui, rule: &RuleInfo, actions: &mut Vec<AppAction>) {
 /// `name (active, dead-letter, scheduled)`, tinted when the DLQ is non-empty.
 fn entity_label(
     ui: &egui::Ui,
-    icon: &str,
+    glyph: &str,
     name: &str,
     counts: Option<&MessageCountDetails>,
 ) -> egui::RichText {
     match counts {
         Some(c) => {
             let text = format!(
-                "{icon} {name} ({}, {}, {})",
+                "{glyph} {name} ({}, {}, {})",
                 c.active, c.dead_letter, c.scheduled
             );
             if c.dead_letter > 0 {
@@ -402,7 +391,7 @@ fn entity_label(
                 egui::RichText::new(text)
             }
         }
-        None => egui::RichText::new(format!("{icon} {name}")),
+        None => egui::RichText::new(format!("{glyph} {name}")),
     }
 }
 

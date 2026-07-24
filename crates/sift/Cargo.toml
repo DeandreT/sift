@@ -11,10 +11,10 @@ anyhow.workspace = true
 crossbeam-channel.workspace = true
 eframe = { workspace = true, features = ["persistence"] }
 egui.workspace = true
-egui-phosphor.workspace = true
 egui-toast.workspace = true
 egui_dock = { workspace = true, features = ["serde"] }
 egui_extras = { workspace = true, features = ["syntect"] }
+lucide-icons.workspace = true
 rfd.workspace = true
 serde.workspace = true
 sift-backend.workspace = true

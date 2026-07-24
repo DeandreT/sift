@@ -54,9 +54,7 @@ pub struct SiftApp {
 
 impl SiftApp {
     pub fn new(cc: &eframe::CreationContext<'_>, log: LogBuffer) -> Self {
-        let mut fonts = egui::FontDefinitions::default();
-        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
-        cc.egui_ctx.set_fonts(fonts);
+        crate::icons::install(&cc.egui_ctx);
 
         let config = AppConfig::load().unwrap_or_else(|e| {
             tracing::error!("failed to load config: {e}; starting with defaults");
