@@ -485,7 +485,20 @@ fn system_properties(ui: &mut egui::Ui, m: &SiftMessage) {
         .show(ui, |ui| {
             let mut row = |label: &str, value: String| {
                 ui.label(egui::RichText::new(label).weak());
-                ui.monospace(value);
+                if value.is_empty() {
+                    ui.monospace("");
+                } else {
+                    // Click the value to copy it (e.g. the DLQ reason).
+                    let resp = ui
+                        .add(
+                            egui::Label::new(egui::RichText::new(&value).monospace())
+                                .sense(egui::Sense::click()),
+                        )
+                        .on_hover_text("Click to copy");
+                    if resp.clicked() {
+                        ui.ctx().copy_text(value.clone());
+                    }
+                }
                 ui.end_row();
             };
             row("Sequence number", m.sequence_number.to_string());
