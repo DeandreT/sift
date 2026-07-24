@@ -3404,6 +3404,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "roxmltree"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1964b10c76125c36f8afe190065a4bf9a87bf324842c05701330bba9f1cacbb"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3713,6 +3722,7 @@ name = "sift-backend"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
+ "serde",
  "sift-core",
  "sift-mgmt",
  "thiserror 2.0.19",
@@ -3749,11 +3759,14 @@ version = "0.1.0"
 dependencies = [
  "quick-xml",
  "reqwest",
+ "roxmltree",
  "sift-core",
  "thiserror 2.0.19",
  "time",
+ "tokio",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]

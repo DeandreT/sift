@@ -9,4 +9,7 @@ pub mod backend;
 pub mod bridge;
 
 pub use backend::{RepaintFn, spawn};
-pub use bridge::{BackendError, BackendHandle, Command, Event, NamespaceId, RequestId};
+pub use bridge::{
+    BackendError, BackendHandle, Command, EntityDescription, EntityInfo, EntityPath, Event,
+    MutationOp, NamespaceId, RequestId,
+};

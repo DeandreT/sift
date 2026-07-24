@@ -9,7 +9,13 @@ mod atom;
 pub mod client;
 pub mod error;
 pub mod model;
+mod write;
 
 pub use client::{Authorizer, ManagementClient};
 pub use error::MgmtError;
-pub use model::NamespaceInfo;
+pub use model::{
+    EntityRuntimeInfo, EntityStatus, MessageCountDetails, NamespaceInfo, QueueInfo,
+    QueueProperties, RuleFilter, RuleInfo, RuleProperties, SubscriptionInfo,
+    SubscriptionProperties, TopicInfo, TopicProperties, format_iso8601, is_unlimited,
+    parse_iso8601, unlimited,
+};

@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 crossbeam-channel.workspace = true
+serde.workspace = true
 sift-core.workspace = true
 sift-mgmt.workspace = true
 thiserror.workspace = true

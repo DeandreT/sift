@@ -1,15 +1,15 @@
 //! The Command/Event vocabulary shared between the UI and the backend, plus
 //! the handle the UI uses to talk to the backend.
-//!
-//! Phase 0 carries only connection commands; the enums grow with each phase
-//! (entity CRUD, messaging, long-running operations, streams).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sift_core::config::NamespaceProfile;
 use sift_core::secrets::SecretString;
-use sift_mgmt::NamespaceInfo;
+use sift_mgmt::{
+    MgmtError, NamespaceInfo, QueueInfo, QueueProperties, RuleInfo, RuleProperties,
+    SubscriptionInfo, SubscriptionProperties, TopicInfo, TopicProperties,
+};
 use uuid::Uuid;
 
 /// Correlates a one-shot request with its response event.
@@ -18,6 +18,122 @@ pub struct RequestId(pub u64);
 
 /// Namespaces are identified by their profile id.
 pub type NamespaceId = Uuid;
+
+/// Addresses one entity inside the connected namespace.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum EntityPath {
+    Queue(String),
+    Topic(String),
+    Subscription {
+        topic: String,
+        name: String,
+    },
+    Rule {
+        topic: String,
+        subscription: String,
+        name: String,
+    },
+}
+
+impl EntityPath {
+    /// The entity's own name (last path segment).
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Queue(name)
+            | Self::Topic(name)
+            | Self::Subscription { name, .. }
+            | Self::Rule { name, .. } => name,
+        }
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Queue(_) => "queue",
+            Self::Topic(_) => "topic",
+            Self::Subscription { .. } => "subscription",
+            Self::Rule { .. } => "rule",
+        }
+    }
+}
+
+impl std::fmt::Display for EntityPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Queue(name) | Self::Topic(name) => f.write_str(name),
+            Self::Subscription { topic, name } => write!(f, "{topic}/{name}"),
+            Self::Rule {
+                topic,
+                subscription,
+                name,
+            } => write!(f, "{topic}/{subscription}/{name}"),
+        }
+    }
+}
+
+/// Full user-settable description, for create/update commands.
+#[derive(Debug, Clone)]
+pub enum EntityDescription {
+    Queue(QueueProperties),
+    Topic(TopicProperties),
+    Subscription(SubscriptionProperties),
+    Rule(RuleProperties),
+}
+
+impl EntityDescription {
+    #[must_use]
+    pub fn path(&self) -> EntityPath {
+        match self {
+            Self::Queue(p) => EntityPath::Queue(p.name.clone()),
+            Self::Topic(p) => EntityPath::Topic(p.name.clone()),
+            Self::Subscription(p) => EntityPath::Subscription {
+                topic: p.topic.clone(),
+                name: p.name.clone(),
+            },
+            Self::Rule(p) => EntityPath::Rule {
+                topic: p.topic.clone(),
+                subscription: p.subscription.clone(),
+                name: p.name.clone(),
+            },
+        }
+    }
+}
+
+/// Full entity state as returned by the service.
+#[derive(Debug, Clone)]
+pub enum EntityInfo {
+    Queue(QueueInfo),
+    Topic(TopicInfo),
+    Subscription(SubscriptionInfo),
+    Rule(RuleInfo),
+}
+
+impl EntityInfo {
+    #[must_use]
+    pub fn path(&self) -> EntityPath {
+        match self {
+            Self::Queue(q) => EntityPath::Queue(q.properties.name.clone()),
+            Self::Topic(t) => EntityPath::Topic(t.properties.name.clone()),
+            Self::Subscription(s) => EntityPath::Subscription {
+                topic: s.properties.topic.clone(),
+                name: s.properties.name.clone(),
+            },
+            Self::Rule(r) => EntityPath::Rule {
+                topic: r.properties.topic.clone(),
+                subscription: r.properties.subscription.clone(),
+                name: r.properties.name.clone(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MutationOp {
+    Created,
+    Updated,
+    Deleted,
+}
 
 /// UI → backend.
 #[derive(Debug)]
@@ -32,6 +148,45 @@ pub enum Command {
     Disconnect {
         ns: NamespaceId,
     },
+    ListQueues {
+        req: RequestId,
+        ns: NamespaceId,
+    },
+    ListTopics {
+        req: RequestId,
+        ns: NamespaceId,
+    },
+    ListSubscriptions {
+        req: RequestId,
+        ns: NamespaceId,
+        topic: String,
+    },
+    ListRules {
+        req: RequestId,
+        ns: NamespaceId,
+        topic: String,
+        subscription: String,
+    },
+    GetEntity {
+        req: RequestId,
+        ns: NamespaceId,
+        path: EntityPath,
+    },
+    CreateEntity {
+        req: RequestId,
+        ns: NamespaceId,
+        desc: EntityDescription,
+    },
+    UpdateEntity {
+        req: RequestId,
+        ns: NamespaceId,
+        desc: EntityDescription,
+    },
+    DeleteEntity {
+        req: RequestId,
+        ns: NamespaceId,
+        path: EntityPath,
+    },
     Shutdown,
 }
 
@@ -45,6 +200,36 @@ pub enum Event {
     },
     Disconnected {
         ns: NamespaceId,
+    },
+    Queues {
+        req: RequestId,
+        result: Result<Vec<QueueInfo>, BackendError>,
+    },
+    Topics {
+        req: RequestId,
+        result: Result<Vec<TopicInfo>, BackendError>,
+    },
+    Subscriptions {
+        req: RequestId,
+        topic: String,
+        result: Result<Vec<SubscriptionInfo>, BackendError>,
+    },
+    Rules {
+        req: RequestId,
+        topic: String,
+        subscription: String,
+        result: Result<Vec<RuleInfo>, BackendError>,
+    },
+    Entity {
+        req: RequestId,
+        path: EntityPath,
+        result: Result<EntityInfo, BackendError>,
+    },
+    Mutated {
+        req: RequestId,
+        op: MutationOp,
+        path: EntityPath,
+        result: Result<Option<EntityInfo>, BackendError>,
     },
 }
 
@@ -65,12 +250,22 @@ impl BackendError {
             detail: None,
         }
     }
+}
 
-    #[must_use]
-    pub fn with_detail(message: impl Into<String>, detail: impl Into<String>) -> Self {
+impl From<MgmtError> for BackendError {
+    fn from(e: MgmtError) -> Self {
+        let detail = match &e {
+            MgmtError::Unauthorized { detail }
+            | MgmtError::Forbidden { detail }
+            | MgmtError::Conflict { detail }
+            | MgmtError::BadRequest { detail }
+            | MgmtError::Throttled { detail }
+            | MgmtError::Server { detail, .. } => Some(detail.clone()).filter(|d| !d.is_empty()),
+            _ => None,
+        };
         Self {
-            message: message.into(),
-            detail: Some(detail.into()),
+            message: e.to_string(),
+            detail,
         }
     }
 }
