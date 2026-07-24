@@ -1230,7 +1230,7 @@ impl eframe::App for SiftApp {
         egui::Panel::left("tree")
             .resizable(true)
             .default_size(280.0)
-            .min_size(180.0)
+            .size_range(180.0..=600.0)
             .show(ui, |ui| {
                 tree_panel::show(ui, &self.conn, &mut self.tree, &mut actions);
             });

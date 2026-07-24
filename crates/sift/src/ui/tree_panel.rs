@@ -77,10 +77,16 @@ pub fn show(
 fn filter_box(ui: &mut egui::Ui, filter: &mut TreeFilter) {
     ui.horizontal(|ui| {
         ui.label(egui_phosphor::regular::MAGNIFYING_GLASS);
-        let response = ui.add(
-            egui::TextEdit::singleline(&mut filter.text)
-                .hint_text("Filter (Ctrl+F)")
-                .desired_width(f32::INFINITY),
+        let show_clear = !filter.text.is_empty();
+
+        // Give the field an explicit finite width. Using `desired_width` of
+        // `f32::INFINITY` with a trailing button inside a resizable panel
+        // feeds back into the panel width and grows it without bound.
+        let reserve = if show_clear { 28.0 } else { 6.0 };
+        let width = (ui.available_width() - reserve).max(24.0);
+        let response = ui.add_sized(
+            [width, ui.spacing().interact_size.y],
+            egui::TextEdit::singleline(&mut filter.text).hint_text("Filter (Ctrl+F)"),
         );
         if response.changed() {
             filter.on_edit();
@@ -89,7 +95,7 @@ fn filter_box(ui: &mut egui::Ui, filter: &mut TreeFilter) {
             response.request_focus();
             filter.focus_requested = false;
         }
-        if !filter.text.is_empty()
+        if show_clear
             && ui
                 .add(egui::Button::new("✕").frame(false))
                 .on_hover_text("Clear filter")
