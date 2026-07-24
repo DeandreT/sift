@@ -286,47 +286,59 @@ fn subscription_node(
         &name,
         Some(&subscription.runtime.count_details),
     );
-    let header = egui::CollapsingHeader::new(label)
-        .id_salt(("subscription", &topic, &name))
-        .show(ui, |ui| match rules {
-            None | Some(Loadable::NotLoaded) => {
+
+    // Custom header so the disclosure triangle expands the rules while a
+    // click on the name opens the subscription (matches queue behavior).
+    let id = ui.make_persistent_id(("subscription", &topic, &name));
+    let state = egui::collapsing_header::CollapsingState::load_with_default_open(
+        ui.ctx(),
+        id,
+        false,
+    );
+    let header = state.show_header(ui, |ui| {
+        let response = ui
+            .selectable_label(false, label)
+            .on_hover_text("Click to open");
+        if response.clicked() {
+            actions.push(AppAction::OpenEntity(path.clone()));
+        }
+        response.context_menu(|ui| {
+            if ui.button("Open").clicked() {
+                actions.push(AppAction::OpenEntity(path.clone()));
+                ui.close();
+            }
+            if ui.button("Add rule…").clicked() {
+                actions.push(AppAction::OpenCreateDialog(CreateKind::Rule {
+                    topic: topic.clone(),
+                    subscription: name.clone(),
+                }));
+                ui.close();
+            }
+            if ui.button("Refresh rules").clicked() {
                 actions.push(AppAction::LoadRules(topic.clone(), name.clone()));
+                ui.close();
             }
-            Some(Loadable::Loading) => {
-                ui.spinner();
-            }
-            Some(Loadable::Failed(e)) => failed_row(
-                ui,
-                e,
-                AppAction::LoadRules(topic.clone(), name.clone()),
-                actions,
-            ),
-            Some(Loadable::Loaded(rules)) => {
-                for rule in rules {
-                    rule_row(ui, rule, actions);
-                }
+            ui.separator();
+            if ui.button("Delete…").clicked() {
+                actions.push(AppAction::RequestDelete(path.clone()));
+                ui.close();
             }
         });
-    header.header_response.context_menu(|ui| {
-        if ui.button("Open").clicked() {
-            actions.push(AppAction::OpenEntity(path.clone()));
-            ui.close();
-        }
-        if ui.button("Add rule…").clicked() {
-            actions.push(AppAction::OpenCreateDialog(CreateKind::Rule {
-                topic: topic.clone(),
-                subscription: name.clone(),
-            }));
-            ui.close();
-        }
-        if ui.button("Refresh rules").clicked() {
+    });
+    header.body(|ui| match rules {
+        None | Some(Loadable::NotLoaded) => {
             actions.push(AppAction::LoadRules(topic.clone(), name.clone()));
-            ui.close();
         }
-        ui.separator();
-        if ui.button("Delete…").clicked() {
-            actions.push(AppAction::RequestDelete(path.clone()));
-            ui.close();
+        Some(Loadable::Loading) => {
+            ui.spinner();
+        }
+        Some(Loadable::Failed(e)) => {
+            failed_row(ui, e, AppAction::LoadRules(topic.clone(), name.clone()), actions);
+        }
+        Some(Loadable::Loaded(rules)) => {
+            for rule in rules {
+                rule_row(ui, rule, actions);
+            }
         }
     });
 }
