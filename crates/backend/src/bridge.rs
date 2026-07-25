@@ -1,7 +1,9 @@
 //! The Command/Event vocabulary shared between the UI and the backend, plus
 //! the handle the UI uses to talk to the backend.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sift_core::body::DecodedBody;
@@ -517,12 +519,14 @@ impl From<MgmtError> for BackendError {
 }
 
 /// Cloneable handle the UI uses to mint request ids and send commands.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 pub struct BackendHandle {
     cmd_tx: tokio::sync::mpsc::UnboundedSender<Command>,
     next_id: Arc<AtomicU64>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl BackendHandle {
     pub(crate) fn new(cmd_tx: tokio::sync::mpsc::UnboundedSender<Command>) -> Self {
         Self {

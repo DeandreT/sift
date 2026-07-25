@@ -1,5 +1,8 @@
 /target
-/dist
+**/dist
+/.next
+/node_modules
+/out
+*.tsbuildinfo
 .env
 *.log
-

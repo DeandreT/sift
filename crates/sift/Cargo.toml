@@ -6,24 +6,29 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lib]
+name = "sift_ui"
+
 [dependencies]
-anyhow.workspace = true
-crossbeam-channel.workspace = true
-eframe = { workspace = true, features = ["persistence"] }
 egui.workspace = true
-egui-toast.workspace = true
 egui_dock = { workspace = true, features = ["serde"] }
 egui_extras = { workspace = true, features = ["syntect"] }
 lucide-icons.workspace = true
-rfd.workspace = true
 serde.workspace = true
 sift-backend.workspace = true
 sift-core.workspace = true
 sift-mgmt.workspace = true
 time.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 uuid.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+eframe = { workspace = true, features = ["persistence"] }
+egui-toast.workspace = true
+rfd.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

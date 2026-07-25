@@ -3,14 +3,8 @@
 // Hide the console window on Windows release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod app;
-mod icons;
-mod logging;
-mod state;
-mod ui;
-
 fn main() -> eframe::Result {
-    let log = logging::init();
+    let log = sift_ui::logging::init();
 
     // Headless import: `sift --import-legacy <path>` migrates namespace
     // profiles from a legacy XML config into the config + OS secret store.
@@ -32,7 +26,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "sift",
         options,
-        Box::new(move |cc| Ok(Box::new(app::SiftApp::new(cc, log)))),
+        Box::new(move |cc| Ok(Box::new(sift_ui::app::SiftApp::new(cc, log)))),
     )
 }
 

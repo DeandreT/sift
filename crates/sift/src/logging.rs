@@ -49,6 +49,11 @@ impl LogBuffer {
         self.lock().len()
     }
 
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<LogEntry>> {
         self.entries
             .lock()

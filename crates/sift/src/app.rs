@@ -29,6 +29,7 @@ use crate::ui::send_dialog::{SendAction, SendDialog};
 use crate::ui::tabs::{self, TabId, TabViewerCtx};
 use crate::ui::{connect_dialog, dialogs, log_panel, send_dialog, tree_panel};
 
+#[allow(missing_debug_implementations)]
 pub struct SiftApp {
     backend: BackendHandle,
     evt_rx: crossbeam_channel::Receiver<Event>,

@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#101417" />
+  <title>sift interactive demo</title>
+  <!-- Older Binaryen builds can corrupt modern wasm-bindgen externref tables. -->
+  <link data-trunk rel="rust" data-wasm-opt="0" />
+  <style>
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #101417;
+      color: #d9dee2;
+      font-family: system-ui, sans-serif;
+    }
+
+    #sift_canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      outline: none;
+    }
+
+    .loader {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-content: center;
+      gap: 14px;
+      text-align: center;
+      pointer-events: none;
+    }
+
+    .loader i {
+      width: 38px;
+      height: 38px;
+      margin-inline: auto;
+      border: 3px solid #384148;
+      border-top-color: #58c6a7;
+      border-radius: 50%;
+      animation: spin 800ms linear infinite;
+    }
+
+    .loader p {
+      margin: 0;
+      color: #8f9aa1;
+      font-size: 13px;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .loader i { animation: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="loader" id="loader">
+    <i aria-hidden="true"></i>
+    <p id="loader_status">Loading sift WebAssembly...</p>
+  </div>
+  <canvas id="sift_canvas"></canvas>
+  <noscript>sift requires JavaScript and WebAssembly.</noscript>
+  <script type="module">
+    let parentScrollY = null;
+    try {
+      if (window.parent !== window) {
+        parentScrollY = window.parent.scrollY;
+      }
+    } catch {
+      // Cross-origin embeds cannot inspect or restore their parent.
+    }
+
+    const check = setInterval(() => {
+      const canvas = document.getElementById("sift_canvas");
+      if (canvas?.dataset.siftReady === "true") {
+        document.getElementById("loader")?.remove();
+        if (parentScrollY !== null) {
+          try {
+            window.parent.scrollTo(0, parentScrollY);
+          } catch {
+            // The application still works when embedded cross-origin.
+          }
+        }
+        clearInterval(check);
+      }
+    }, 200);
+  </script>
+</body>
+</html>

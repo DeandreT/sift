@@ -19,6 +19,7 @@ pub enum TabId {
 }
 
 /// Borrowed view of app state handed to the dock each frame.
+#[derive(Debug)]
 pub struct TabViewerCtx<'a> {
     pub connections: &'a [Connection],
     pub dashboard: &'a mut DashboardState,
@@ -106,10 +107,10 @@ impl TabViewerCtx<'_> {
 /// Render one entity's content (overview + message pages). Shared by the
 /// docked tab and by a popped-out viewport, so `popped` selects whether the
 /// toolbar offers "Pop out" (dock → window) or "Dock" (window → dock).
-pub fn render_entity(
+pub fn render_entity<S: std::hash::BuildHasher>(
     ui: &mut egui::Ui,
     connected: bool,
-    entities: &mut HashMap<ScopedEntity, EntityTabState>,
+    entities: &mut HashMap<ScopedEntity, EntityTabState, S>,
     peek_batch: u32,
     scoped: &ScopedEntity,
     popped: bool,
@@ -127,9 +128,9 @@ pub fn render_entity(
     });
 }
 
-fn render_entity_inner(
+fn render_entity_inner<S: std::hash::BuildHasher>(
     ui: &mut egui::Ui,
-    entities: &mut HashMap<ScopedEntity, EntityTabState>,
+    entities: &mut HashMap<ScopedEntity, EntityTabState, S>,
     peek_batch: u32,
     scoped: &ScopedEntity,
     popped: bool,

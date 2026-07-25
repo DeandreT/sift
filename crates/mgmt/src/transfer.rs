@@ -4,7 +4,9 @@
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::client::ManagementClient;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::error::MgmtError;
 use crate::model::{QueueProperties, RuleProperties, SubscriptionProperties, TopicProperties};
 
@@ -65,6 +67,7 @@ impl std::fmt::Display for ImportOutcome {
 }
 
 /// Collect every queue, topic, subscription, and rule description.
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn export(client: &ManagementClient) -> Result<NamespaceExport, MgmtError> {
     let mut out = NamespaceExport {
         sift_export_version: NamespaceExport::VERSION,
@@ -90,6 +93,7 @@ pub async fn export(client: &ManagementClient) -> Result<NamespaceExport, MgmtEr
 
 /// Create (or update) entities from an export. Parents are created before
 /// children so subscriptions and rules land on existing topics.
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn import(
     client: &ManagementClient,
     data: &NamespaceExport,
@@ -157,6 +161,7 @@ pub async fn import(
 }
 
 /// Shared create-or-update-or-skip flow for entities that have an update verb.
+#[cfg(not(target_arch = "wasm32"))]
 async fn apply<T, C, U, CFut, UFut>(
     outcome: &mut ImportOutcome,
     label: String,

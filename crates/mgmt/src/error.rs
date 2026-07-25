@@ -1,6 +1,7 @@
 //! Error type for management API calls, mapping HTTP statuses to the
 //! conditions users actually need to distinguish.
 
+#[cfg(not(target_arch = "wasm32"))]
 use reqwest::StatusCode;
 
 #[derive(Debug, thiserror::Error)]
@@ -21,8 +22,12 @@ pub enum MgmtError {
     Throttled { detail: String },
     #[error("the service returned HTTP {status}: {detail}")]
     Server { status: u16, detail: String },
+    #[cfg(not(target_arch = "wasm32"))]
     #[error("request failed: {0}")]
     Http(#[from] reqwest::Error),
+    #[cfg(target_arch = "wasm32")]
+    #[error("request failed: {0}")]
+    Http(String),
     #[error("could not parse the service response: {0}")]
     Xml(String),
     #[error("invalid management URL: {0}")]
@@ -32,6 +37,7 @@ pub enum MgmtError {
 impl MgmtError {
     /// Map a non-success HTTP response to an error. `detail` is the raw
     /// response body (the service returns an XML `<Error>` document).
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn from_status(status: StatusCode, path: &str, detail: String) -> Self {
         match status {
             StatusCode::UNAUTHORIZED => Self::Unauthorized { detail },
@@ -57,7 +63,10 @@ impl MgmtError {
         match self {
             Self::Throttled { .. } => true,
             Self::Server { status, .. } => *status >= 500,
+            #[cfg(not(target_arch = "wasm32"))]
             Self::Http(e) => e.is_timeout() || e.is_connect(),
+            #[cfg(target_arch = "wasm32")]
+            Self::Http(_) => false,
             _ => false,
         }
     }

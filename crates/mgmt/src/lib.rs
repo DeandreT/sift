@@ -5,13 +5,17 @@
 //! Phase 0 covers authentication plumbing and `GET /$namespaceinfo`; entity
 //! CRUD arrives in Phase 1.
 
+#[cfg(not(target_arch = "wasm32"))]
 mod atom;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod client;
 pub mod error;
 pub mod model;
 pub mod transfer;
+#[cfg(not(target_arch = "wasm32"))]
 mod write;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use client::{Authorizer, ManagementClient};
 pub use error::MgmtError;
 pub use model::{
