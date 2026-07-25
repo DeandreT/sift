@@ -394,7 +394,9 @@ impl DemoApp {
             | AppAction::RequestDelete(_)
             | AppAction::CancelOp(_)
             | AppAction::ExportNamespace(_)
-            | AppAction::ImportNamespace { .. } => {
+            | AppAction::ImportNamespace { .. }
+            | AppAction::SaveMessageBody(_)
+            | AppAction::SaveMessageTemplate(_) => {
                 self.note("This command is disabled in the public simulation");
             }
         }

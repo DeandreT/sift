@@ -19,6 +19,8 @@ long-running operations in one desktop workspace.
   without discarding the original payload.
 - Send, schedule, cancel, defer, retrieve, settle, resend, and dead-letter
   messages.
+- Open raw payload files in the sender, save exact message bodies, and reuse
+  message metadata through versioned JSON templates.
 - Browse session state and messages without retaining the session lock.
 - Create and delete entities, change entity status, and manage subscription
   rules.
@@ -94,6 +96,13 @@ cargo run -p sift -- --import-legacy path/to/ServiceBusExplorer.exe.config
 ```
 
 The same import is available from the **File** menu.
+
+The sender can open text, JSON, XML, gzip, and binary payload files without
+changing their bytes. Use **Open template** and **Save template** to move a
+composed message between namespaces or keep it for later. The message inspector
+can export either the exact body or a reusable `.sift-message.json` template;
+templates include user-settable metadata and custom properties, never broker
+lock or dead-letter state.
 
 ## Workspace
 

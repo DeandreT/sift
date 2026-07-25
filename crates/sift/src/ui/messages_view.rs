@@ -37,7 +37,7 @@ pub fn show(
 
     if view.selected.is_some() {
         ui.separator();
-        message_viewer(ui, view);
+        message_viewer(ui, view, actions);
     }
 }
 
@@ -368,7 +368,10 @@ fn message_table(ui: &mut egui::Ui, view: &mut MessagesView, height: f32) {
 }
 
 #[allow(clippy::too_many_lines)] // header + split panels read best in one function
-fn message_viewer(ui: &mut egui::Ui, view: &mut MessagesView) {
+fn message_viewer(ui: &mut egui::Ui, view: &mut MessagesView, actions: &mut Vec<AppAction>) {
+    #[cfg(target_arch = "wasm32")]
+    let _ = actions;
+
     let Some(index) = view.selected else { return };
     let Some(message) = view.rows.get(index) else {
         view.selected = None;
@@ -399,6 +402,19 @@ fn message_viewer(ui: &mut egui::Ui, view: &mut MessagesView) {
             ui.label(egui::RichText::new(content_type).weak());
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            #[cfg(not(target_arch = "wasm32"))]
+            ui.menu_button(icon(Icon::Download), |ui| {
+                if ui.button("Save body...").clicked() {
+                    actions.push(AppAction::SaveMessageBody(Box::new(message.clone())));
+                    ui.close();
+                }
+                if ui.button("Save message template...").clicked() {
+                    actions.push(AppAction::SaveMessageTemplate(Box::new(message.clone())));
+                    ui.close();
+                }
+            })
+            .response
+            .on_hover_text("Export message");
             // One-click copy of the (decoded) body.
             if ui
                 .button(format!("{} Copy body", icon(Icon::Copy)))

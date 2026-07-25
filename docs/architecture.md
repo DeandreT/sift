@@ -214,6 +214,15 @@ Preserving the original data section lets resend and resubmit retain binary or
 compressed payload fidelity. Resend removes Service Bus-owned system properties
 while keeping the body and eligible application properties.
 
+The native message file workflow uses a versioned `sift-message` JSON envelope.
+UTF-8 bodies remain text in the file; binary and gzip bodies use base64. The
+envelope carries only fields that can be supplied on a new outbound message:
+message and correlation ids, subject, content type, session and addressing
+fields, TTL, and application properties. Sequence numbers, locks, delivery
+counts, enqueue timestamps, and dead-letter metadata are intentionally omitted.
+Raw payload export bypasses the envelope and writes the preserved data-section
+bytes directly.
+
 Peek-lock receives return a lock token to the UI. Complete, abandon, defer, and
 dead-letter commands send that token back to the backend. Receive-and-delete is
 separate and is presented as a destructive action. Deferred retrieval and

@@ -17,6 +17,7 @@ use sift_core::connection::NamespaceConnection;
 use sift_core::secrets::{SecretKind, SecretRef, SecretStore, SecretString};
 
 use crate::logging::LogBuffer;
+use crate::message_files;
 use crate::state::{
     AppAction, AutoRefresh, Connection, DashboardState, EntityTabState, EntityTree, Loadable,
     PendingConnect, RunningOp, ScopedEntity, TreeFilter,
@@ -812,6 +813,18 @@ impl SiftApp {
                     None => SendDialog::new(ns, target),
                 });
             }
+            AppAction::SaveMessageBody(message) => match message_files::save_body(&message) {
+                Ok(true) => self.toast(ToastKind::Success, "Saved message body"),
+                Ok(false) => {}
+                Err(error) => self.toast(ToastKind::Error, error),
+            },
+            AppAction::SaveMessageTemplate(message) => {
+                match message_files::save_template(&message) {
+                    Ok(true) => self.toast(ToastKind::Success, "Saved message template"),
+                    Ok(false) => {}
+                    Err(error) => self.toast(ToastKind::Error, error),
+                }
+            }
             AppAction::PopOutEntity(scoped) => {
                 if let Some(location) = self.dock.find_tab(&TabId::Entity(scoped.clone())) {
                     self.dock.remove_tab(location);
@@ -1338,6 +1351,22 @@ impl SiftApp {
             match send_dialog::show(ctx, &mut dialog) {
                 Some(SendAction::Send) => {
                     self.send_dialog = self.submit_send_dialog(dialog);
+                }
+                Some(SendAction::LoadPayload) => {
+                    message_files::load_payload(&mut dialog);
+                    self.send_dialog = Some(dialog);
+                }
+                Some(SendAction::LoadTemplate) => {
+                    message_files::load_template(&mut dialog);
+                    self.send_dialog = Some(dialog);
+                }
+                Some(SendAction::SaveTemplate) => {
+                    match message_files::save_composed_template(&mut dialog) {
+                        Ok(true) => self.toast(ToastKind::Success, "Saved message template"),
+                        Ok(false) => {}
+                        Err(error) => dialog.error = Some(error),
+                    }
+                    self.send_dialog = Some(dialog);
                 }
                 Some(SendAction::Close) => {}
                 None => self.send_dialog = Some(dialog),

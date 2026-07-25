@@ -9,6 +9,7 @@ pub mod config;
 pub mod connection;
 pub mod legacy_import;
 pub mod message;
+pub mod message_file;
 pub mod sas;
 pub mod secrets;
 

@@ -18,6 +18,8 @@ pub struct SendDialog {
     pub content_type: String,
     pub correlation_id: String,
     pub session_id: String,
+    pub to: String,
+    pub reply_to: String,
     /// Seconds; empty = entity default.
     pub ttl_seconds: String,
     pub properties: Vec<(String, String)>,
@@ -40,6 +42,8 @@ impl SendDialog {
             content_type: String::new(),
             correlation_id: String::new(),
             session_id: String::new(),
+            to: String::new(),
+            reply_to: String::new(),
             ttl_seconds: String::new(),
             properties: Vec::new(),
             repeat: 1,
@@ -71,6 +75,8 @@ impl SendDialog {
             content_type: from.content_type.unwrap_or_default(),
             correlation_id: from.correlation_id.unwrap_or_default(),
             session_id: from.session_id.unwrap_or_default(),
+            to: from.to.unwrap_or_default(),
+            reply_to: from.reply_to.unwrap_or_default(),
             ttl_seconds: from
                 .time_to_live
                 .map(|d| d.as_secs().to_string())
@@ -80,8 +86,54 @@ impl SendDialog {
         }
     }
 
-    /// Validate into `repeat` outbound messages; sets `error` on failure.
-    pub fn build(&mut self) -> Option<Vec<OutboundMessage>> {
+    /// Replace every editable message field from an imported template.
+    pub fn load_message(&mut self, from: OutboundMessage) {
+        self.body = from.body;
+        self.raw_bytes = from.raw_bytes;
+        self.message_id = from.message_id.unwrap_or_default();
+        self.subject = from.subject.unwrap_or_default();
+        self.content_type = from.content_type.unwrap_or_default();
+        self.correlation_id = from.correlation_id.unwrap_or_default();
+        self.session_id = from.session_id.unwrap_or_default();
+        self.to = from.to.unwrap_or_default();
+        self.reply_to = from.reply_to.unwrap_or_default();
+        self.ttl_seconds = from
+            .time_to_live
+            .map(|duration| duration.as_secs().to_string())
+            .unwrap_or_default();
+        self.properties = from.application_properties;
+        self.repeat = 1;
+        self.schedule_in_minutes.clear();
+        self.error = None;
+    }
+
+    /// Replace only the payload, retaining the other composed properties.
+    pub fn load_payload(&mut self, bytes: Vec<u8>) {
+        let decoded = sift_core::body::decode(bytes.clone());
+        if !decoded.gzipped
+            && decoded.format != sift_core::body::BodyFormat::Binary
+            && let Ok(text) = std::str::from_utf8(&bytes)
+        {
+            text.clone_into(&mut self.body);
+            self.raw_bytes = None;
+        } else {
+            self.body.clear();
+            self.raw_bytes = Some(bytes);
+        }
+        if self.content_type.trim().is_empty() {
+            match decoded.format {
+                sift_core::body::BodyFormat::Json => "application/json",
+                sift_core::body::BodyFormat::Xml => "application/xml",
+                sift_core::body::BodyFormat::Text => "text/plain",
+                _ => "",
+            }
+            .clone_into(&mut self.content_type);
+        }
+        self.error = None;
+    }
+
+    /// Validate one outbound message; sets `error` on failure.
+    pub fn build_message(&mut self) -> Option<OutboundMessage> {
         let ttl = match self.ttl_seconds.trim() {
             "" => None,
             text => match text.parse::<u64>() {
@@ -97,7 +149,7 @@ impl SendDialog {
             (!t.is_empty()).then(|| t.to_owned())
         };
 
-        let template = OutboundMessage {
+        Some(OutboundMessage {
             body: self.body.clone(),
             raw_bytes: self.raw_bytes.clone(),
             message_id: non_empty(&self.message_id),
@@ -105,8 +157,8 @@ impl SendDialog {
             content_type: non_empty(&self.content_type),
             correlation_id: non_empty(&self.correlation_id),
             session_id: non_empty(&self.session_id),
-            to: None,
-            reply_to: None,
+            to: non_empty(&self.to),
+            reply_to: non_empty(&self.reply_to),
             time_to_live: ttl,
             application_properties: self
                 .properties
@@ -114,14 +166,22 @@ impl SendDialog {
                 .filter(|(k, _)| !k.trim().is_empty())
                 .map(|(k, v)| (k.trim().to_owned(), v.clone()))
                 .collect(),
-        };
-        Some(vec![template; self.repeat as usize])
+        })
+    }
+
+    /// Validate into `repeat` outbound messages; sets `error` on failure.
+    pub fn build(&mut self) -> Option<Vec<OutboundMessage>> {
+        let repeat = self.repeat as usize;
+        self.build_message().map(|message| vec![message; repeat])
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendAction {
     Send,
+    LoadPayload,
+    LoadTemplate,
+    SaveTemplate,
     Close,
 }
 
@@ -137,6 +197,28 @@ pub fn show(ctx: &egui::Context, dialog: &mut SendDialog) -> Option<SendAction> 
             dialog.target
         ));
         ui.add_space(8.0);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        ui.horizontal(|ui| {
+            if ui
+                .button(format!("{} Open payload", icon(Icon::FolderOpen)))
+                .clicked()
+            {
+                action = Some(SendAction::LoadPayload);
+            }
+            if ui
+                .button(format!("{} Open template", icon(Icon::FileInput)))
+                .clicked()
+            {
+                action = Some(SendAction::LoadTemplate);
+            }
+            if ui
+                .button(format!("{} Save template", icon(Icon::Save)))
+                .clicked()
+            {
+                action = Some(SendAction::SaveTemplate);
+            }
+        });
 
         if dialog.raw_bytes.is_some() {
             ui.horizontal(|ui| {
@@ -196,6 +278,9 @@ pub fn show(ctx: &egui::Context, dialog: &mut SendDialog) -> Option<SendAction> 
                     "required for session entities",
                 );
                 field(ui, "TTL (s)", &mut dialog.ttl_seconds, "entity default");
+                ui.end_row();
+                field(ui, "To", &mut dialog.to, "optional address");
+                field(ui, "Reply to", &mut dialog.reply_to, "optional address");
                 ui.end_row();
                 field(
                     ui,
@@ -261,4 +346,56 @@ pub fn show(ctx: &egui::Context, dialog: &mut SendDialog) -> Option<SendAction> 
         action = Some(SendAction::Close);
     }
     action
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sift_backend::EntityPath;
+
+    fn dialog() -> SendDialog {
+        SendDialog::new(NamespaceId::nil(), EntityPath::Queue("orders".to_owned()))
+    }
+
+    #[test]
+    fn text_payload_keeps_original_bytes_and_infers_content_type() {
+        let mut dialog = dialog();
+        dialog.load_payload(br#"{"order":42}"#.to_vec());
+
+        assert_eq!(dialog.body, r#"{"order":42}"#);
+        assert!(dialog.raw_bytes.is_none());
+        assert_eq!(dialog.content_type, "application/json");
+        assert_eq!(
+            dialog.build_message().unwrap().payload(),
+            br#"{"order":42}"#
+        );
+    }
+
+    #[test]
+    fn binary_payload_is_retained_verbatim() {
+        let bytes = vec![0, 1, 2, 0xff, 0xfe];
+        let mut dialog = dialog();
+        dialog.load_payload(bytes.clone());
+
+        assert!(dialog.body.is_empty());
+        assert_eq!(dialog.raw_bytes.as_deref(), Some(bytes.as_slice()));
+        assert_eq!(dialog.build_message().unwrap().payload(), bytes);
+    }
+
+    #[test]
+    fn loaded_message_populates_addressing_fields() {
+        let mut dialog = dialog();
+        dialog.load_message(OutboundMessage {
+            body: "hello".to_owned(),
+            message_id: Some("message-1".to_owned()),
+            to: Some("orders".to_owned()),
+            reply_to: Some("order-replies".to_owned()),
+            ..OutboundMessage::default()
+        });
+
+        let message = dialog.build_message().unwrap();
+        assert_eq!(message.message_id.as_deref(), Some("message-1"));
+        assert_eq!(message.to.as_deref(), Some("orders"));
+        assert_eq!(message.reply_to.as_deref(), Some("order-replies"));
+    }
 }

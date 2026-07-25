@@ -9,5 +9,7 @@ pub mod app;
 pub mod icons;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod logging;
+#[cfg(not(target_arch = "wasm32"))]
+mod message_files;
 pub mod state;
 pub mod ui;

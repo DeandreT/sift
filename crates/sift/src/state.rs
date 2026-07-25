@@ -436,6 +436,10 @@ pub enum AppAction {
         session_id: Option<String>,
         count: u32,
     },
+    /// Save the selected message's exact body bytes to a local file.
+    SaveMessageBody(Box<SiftMessage>),
+    /// Save the selected message as a reusable `.sift-message.json` template.
+    SaveMessageTemplate(Box<SiftMessage>),
 }
 
 /// A running long-operation, tracked for the operations strip.

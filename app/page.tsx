@@ -29,7 +29,7 @@ const capabilities = [
     icon: Search,
     number: "02",
     title: "Read the payload",
-    text: "Inspect JSON, XML, text, gzip, base64-wrapped, AMQP value, and binary bodies while keeping the original bytes available for faithful resend.",
+    text: "Inspect JSON, XML, text, gzip, base64-wrapped, AMQP value, and binary bodies. Save exact payload bytes or reusable message templates from the native app.",
   },
   {
     icon: Radio,
