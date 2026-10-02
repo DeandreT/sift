@@ -8,7 +8,7 @@ issues. Self-skipped live tests count as not run.
 | Candidate | Value |
 | --- | --- |
 | Version | 0.1.0 development preview |
-| Source revision | Record committed candidate revision before release |
+| Implementation revision | [08bf590](https://github.com/DeandreT/sift/commit/08bf5909b1df31ab9c991e40c31bc24061624a04); tagged release revision is recorded in its manifest |
 | Windows archive checksum / workflow | Pending hosted build |
 | Linux archive checksum / workflow | Pending hosted build |
 | Disposable namespace | Pending authorized test credentials; omit secrets |
@@ -47,7 +47,13 @@ supported Ubuntu/Windows or live Azure gates below.
 - Release-script guards, workflow syntax, checksums, and documentation links pass.
 - Packaged development-binary headless startup/configuration and visible-window
   checks pass on a private Xvfb display with software graphics.
-- Final optimized binary packaging and smoke checks: pending below.
+- The clean committed optimized binary was packaged and passed member/archive
+  checksums, isolated headless startup/configuration, and visible-window smoke
+  checks on the private Xvfb desktop. This developer archive was built from
+  `08bf5909b1df31ab9c991e40c31bc24061624a04`; SHA-256:
+  `c3f4725546503fae03517bb476a8f2920ebffbcac665c19334c2f75eef3b6b3c`.
+  It is an Arch-built developer artifact, not the Ubuntu distribution binary;
+  use the hosted Ubuntu 22.04 build for the supported Linux release.
 
 ## Automation
 
