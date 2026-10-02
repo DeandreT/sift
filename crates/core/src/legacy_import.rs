@@ -222,7 +222,7 @@ mod tests {
         let report = import_entries(entries, &mut config, &secrets);
 
         assert_eq!(report.imported, vec!["SB Dev", "SB Prod"]);
-        assert!(report.updated.is_empty());
+        assert_eq!(report.updated.len(), 0);
         assert_eq!(report.skipped.len(), 1);
         assert_eq!(report.skipped[0].0, "Broken");
         assert_eq!(config.profiles.len(), 2);
@@ -252,7 +252,7 @@ mod tests {
         import_entries(entries, &mut config, &secrets);
         let report = import_entries(parse_legacy_config(SAMPLE).unwrap(), &mut config, &secrets);
 
-        assert!(report.imported.is_empty());
+        assert_eq!(report.imported.len(), 0);
         assert_eq!(report.updated, vec!["SB Dev", "SB Prod"]);
         assert_eq!(config.profiles.len(), 2);
     }

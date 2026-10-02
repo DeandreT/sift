@@ -1,9 +1,12 @@
 //! The management HTTP client: request signing, api-version handling, and
 //! status-code mapping.
 
+use azure_core::credentials::TokenCredential;
 use reqwest::header;
 use sift_core::connection::{Credential, NamespaceConnection};
 use sift_core::sas::SasTokenProvider;
+use sift_core::secrets::SecretString;
+use std::sync::Arc;
 use url::Url;
 
 use crate::atom;
@@ -21,15 +24,14 @@ const ATOM_CONTENT_TYPE: &str = "application/atom+xml;type=entry;charset=utf-8";
 const PAGE_SIZE: usize = 100;
 
 /// Produces `Authorization` header values for management requests.
-///
-/// A `Bearer` variant for Microsoft Entra ID credentials is added in Phase 1's
-/// AAD milestone.
 #[derive(Debug)]
 pub enum Authorizer {
     /// Mints a SAS token per resource URI from a shared access key.
     Sas(SasTokenProvider),
     /// A pre-minted `SharedAccessSignature ...` token used verbatim.
-    StaticSas(String),
+    StaticSas(SecretString),
+    /// Shared refreshable credential, also used by the AMQP runtime.
+    Bearer(Arc<dyn TokenCredential>),
 }
 
 impl Authorizer {
@@ -40,15 +42,22 @@ impl Authorizer {
                 SasTokenProvider::from_connection(conn)
                     .expect("SasKey credential always yields a provider"),
             ),
-            Credential::SasToken(token) => Self::StaticSas(token.expose().to_owned()),
+            Credential::SasToken(token) => Self::StaticSas(token.clone()),
         }
     }
 
-    fn header_value(&self, resource_uri: &str) -> String {
-        match self {
+    async fn header_value(&self, resource_uri: &str) -> Result<String, MgmtError> {
+        Ok(match self {
             Self::Sas(provider) => provider.token_for(resource_uri).value,
-            Self::StaticSas(token) => token.clone(),
-        }
+            Self::StaticSas(token) => token.expose().to_owned(),
+            Self::Bearer(credential) => {
+                let token = credential
+                    .get_token(&[crate::auth::SERVICE_BUS_SCOPE], None)
+                    .await
+                    .map_err(|_| MgmtError::Authentication(crate::auth::SIGN_IN_HELP.into()))?;
+                format!("Bearer {}", token.token.secret())
+            }
+        })
     }
 }
 
@@ -63,6 +72,7 @@ pub struct ManagementClient {
 impl ManagementClient {
     pub fn new(conn: &NamespaceConnection) -> Result<Self, MgmtError> {
         let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .user_agent(USER_AGENT)
             .timeout(std::time::Duration::from_secs(30))
             .build()?;
@@ -70,6 +80,28 @@ impl ManagementClient {
             http,
             base: conn.https_base(),
             authorizer: Authorizer::from_connection(conn),
+        })
+    }
+
+    pub fn new_with_credential(
+        endpoint: &Url,
+        credential: Arc<dyn TokenCredential>,
+    ) -> Result<Self, MgmtError> {
+        let endpoint = sift_core::connection::namespace_endpoint(endpoint.as_str())
+            .map_err(MgmtError::Authentication)?;
+        let base = Url::parse(&format!(
+            "https://{}/",
+            endpoint.host_str().unwrap_or_default()
+        ))?;
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(30))
+            .user_agent(USER_AGENT)
+            .build()?;
+        Ok(Self {
+            http,
+            base,
+            authorizer: Authorizer::Bearer(credential),
         })
     }
 
@@ -208,6 +240,10 @@ impl ManagementClient {
     }
 
     pub async fn create_rule(&self, props: &RuleProperties) -> Result<RuleInfo, MgmtError> {
+        props
+            .filter
+            .validate()
+            .map_err(|detail| MgmtError::BadRequest { detail })?;
         let path = format!(
             "{}/rules/{}",
             subscription_path(&props.topic, &props.subscription),
@@ -225,7 +261,23 @@ impl ManagementClient {
     // ---- HTTP plumbing -------------------------------------------------------
 
     fn url_for(&self, path: &str, query: &[(&str, String)]) -> Result<Url, MgmtError> {
+        // Entity names may come from imported definitions. Never let them
+        // redirect a namespace credential to another origin or inject a query.
+        let invalid = || MgmtError::BadRequest {
+            detail: "Entity paths must be relative to the connected namespace.".into(),
+        };
+        if path.starts_with(['/', '\\']) || Url::parse(path).is_ok() {
+            return Err(invalid());
+        }
         let mut url = self.base.join(path)?;
+        if url.origin() != self.base.origin()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(invalid());
+        }
         {
             let mut pairs = url.query_pairs_mut();
             pairs.append_pair("api-version", API_VERSION);
@@ -254,7 +306,9 @@ impl ManagementClient {
             .get(url.clone())
             .header(
                 header::AUTHORIZATION,
-                self.authorizer.header_value(&Self::resource_uri(&url)),
+                self.authorizer
+                    .header_value(&Self::resource_uri(&url))
+                    .await?,
             )
             .send()
             .await?;
@@ -271,7 +325,9 @@ impl ManagementClient {
             .put(url.clone())
             .header(
                 header::AUTHORIZATION,
-                self.authorizer.header_value(&Self::resource_uri(&url)),
+                self.authorizer
+                    .header_value(&Self::resource_uri(&url))
+                    .await?,
             )
             .header(header::CONTENT_TYPE, ATOM_CONTENT_TYPE)
             .body(body.to_owned());
@@ -289,7 +345,9 @@ impl ManagementClient {
             .delete(url.clone())
             .header(
                 header::AUTHORIZATION,
-                self.authorizer.header_value(&Self::resource_uri(&url)),
+                self.authorizer
+                    .header_value(&Self::resource_uri(&url))
+                    .await?,
             )
             .send()
             .await?;
@@ -345,4 +403,89 @@ fn returned<T>(parsed: Option<T>) -> Result<T, MgmtError> {
     parsed.ok_or_else(|| {
         MgmtError::Xml("the service response did not contain an entity description".into())
     })
+}
+
+#[cfg(test)]
+mod authentication_tests {
+    use super::*;
+    use azure_core::credentials::{AccessToken, TokenRequestOptions};
+
+    #[derive(Debug)]
+    struct RecordingCredential;
+
+    #[async_trait::async_trait]
+    impl TokenCredential for RecordingCredential {
+        async fn get_token(
+            &self,
+            scopes: &[&str],
+            _: Option<TokenRequestOptions>,
+        ) -> azure_core::Result<AccessToken> {
+            assert_eq!(scopes, [crate::auth::SERVICE_BUS_SCOPE]);
+            Ok(AccessToken::new(
+                "test-secret-token",
+                time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn bearer_management_uses_service_bus_scope_and_redacts_debug() {
+        let authorizer = Authorizer::Bearer(Arc::new(RecordingCredential));
+        assert_eq!(
+            authorizer
+                .header_value("https://orders.servicebus.windows.net/$namespaceinfo")
+                .await
+                .unwrap(),
+            "Bearer test-secret-token"
+        );
+        assert!(!format!("{authorizer:?}").contains("test-secret-token"));
+        let endpoint =
+            sift_core::connection::namespace_endpoint("orders.servicebus.windows.net").unwrap();
+        let client =
+            ManagementClient::new_with_credential(&endpoint, Arc::new(RecordingCredential))
+                .unwrap();
+        assert_eq!(
+            client.base.as_str(),
+            "https://orders.servicebus.windows.net/"
+        );
+    }
+
+    #[test]
+    fn imported_entity_paths_cannot_change_the_authorization_destination() {
+        let endpoint =
+            sift_core::connection::namespace_endpoint("orders.servicebus.windows.net").unwrap();
+        let client =
+            ManagementClient::new_with_credential(&endpoint, Arc::new(RecordingCredential))
+                .unwrap();
+        for path in [
+            "https://attacker.example/queue",
+            "//attacker.example/queue",
+            "\\\\attacker.example/queue",
+            "https://orders.servicebus.windows.net/queue",
+            "https://user@orders.servicebus.windows.net/queue",
+            "queue?extra=query",
+            "queue#fragment",
+        ] {
+            assert!(client.url_for(path, &[]).is_err(), "accepted {path}");
+        }
+        let url = client
+            .url_for("parent/queue/subscriptions/sub/rules/$Default", &[])
+            .unwrap();
+        assert_eq!(url.origin(), client.base.origin());
+        assert_eq!(url.path(), "/parent/queue/subscriptions/sub/rules/$Default");
+        assert_eq!(url.query(), Some("api-version=2021-05"));
+    }
+
+    #[tokio::test]
+    async fn static_sas_headers_remain_verbatim_and_debug_is_redacted() {
+        let authorizer = Authorizer::StaticSas(SecretString::from("SharedAccessSignature secret"));
+        assert_eq!(
+            authorizer
+                .header_value("https://orders.servicebus.windows.net")
+                .await
+                .unwrap(),
+            "SharedAccessSignature secret"
+        );
+        assert!(!format!("{authorizer:?}").contains("SharedAccessSignature secret"));
+    }
 }

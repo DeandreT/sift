@@ -10,12 +10,14 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::error::MgmtError;
 use crate::model::{
-    EntityRuntimeInfo, EntityStatus, MessageCountDetails, NamespaceInfo, QueueInfo,
-    QueueProperties, RuleFilter, RuleInfo, RuleProperties, SubscriptionInfo,
+    CorrelationPropertyType, EntityRuntimeInfo, EntityStatus, MessageCountDetails, NamespaceInfo,
+    QueueInfo, QueueProperties, RuleFilter, RuleInfo, RuleProperties, SubscriptionInfo,
     SubscriptionProperties, TopicInfo, TopicProperties, parse_iso8601,
 };
 
 const XSI_NS: &str = "http://www.w3.org/2001/XMLSchema-instance";
+const XSD_NS: &str = "http://www.w3.org/2001/XMLSchema";
+const SB_NS: &str = "http://schemas.microsoft.com/netservices/2010/10/servicebus/connect";
 
 fn parse_doc(xml: &str) -> Result<Document<'_>, MgmtError> {
     Document::parse(xml).map_err(|e| MgmtError::Xml(e.to_string()))
@@ -55,7 +57,7 @@ fn entries<'a, 'input>(doc: &'a Document<'input>) -> Vec<Node<'a, 'input>> {
 // ---- field readers --------------------------------------------------------
 
 fn is_nil(node: Node<'_, '_>) -> bool {
-    node.attribute((XSI_NS, "nil")) == Some("true")
+    matches!(node.attribute((XSI_NS, "nil")), Some("true" | "1"))
 }
 
 fn child_text<'a>(parent: Node<'a, '_>, name: &str) -> Option<&'a str> {
@@ -283,16 +285,101 @@ pub(crate) fn parse_subscription_feed(
 
 // ---- rules ------------------------------------------------------------------
 
-fn rule_from_entry(entry: Node<'_, '_>, topic: &str, subscription: &str) -> Option<RuleInfo> {
-    let (name, node) = entry_description(entry, "RuleDescription")?;
+fn qualified_type(
+    node: Node<'_, '_>,
+    expected_namespace: &str,
+) -> Result<Option<String>, MgmtError> {
+    let Some(value) = node.attribute((XSI_NS, "type")) else {
+        return Ok(None);
+    };
+    let (prefix, name) = value
+        .split_once(':')
+        .map_or((None, value), |(prefix, name)| (Some(prefix), name));
+    if name.is_empty() || node.lookup_namespace_uri(prefix) != Some(expected_namespace) {
+        return Err(MgmtError::Xml(format!(
+            "unsupported XML type '{value}' on {}",
+            node.tag_name().name()
+        )));
+    }
+    Ok(Some(name.to_owned()))
+}
 
-    let filter_node = node.children().find(|n| n.tag_name().name() == "Filter");
-    let filter = filter_node.map_or(RuleFilter::True, |f| {
-        match f.attribute((XSI_NS, "type")).unwrap_or_default() {
-            "SqlFilter" => RuleFilter::Sql {
-                expression: text(f, "SqlExpression").unwrap_or_default(),
-            },
-            "CorrelationFilter" => RuleFilter::Correlation {
+#[derive(Debug, Default)]
+struct CorrelationProperties {
+    values: Vec<(String, String)>,
+    types: std::collections::BTreeMap<String, CorrelationPropertyType>,
+}
+
+fn correlation_properties(filter: Node<'_, '_>) -> Result<CorrelationProperties, MgmtError> {
+    let mut out = CorrelationProperties::default();
+    let Some(properties) = filter
+        .children()
+        .find(|n| n.tag_name().name() == "Properties")
+    else {
+        return Ok(out);
+    };
+    for pair in properties.children().filter(Node::is_element) {
+        if pair.tag_name().name() != "KeyValueOfstringanyType" {
+            return Err(MgmtError::Xml(
+                "unsupported correlation property representation".into(),
+            ));
+        }
+        let key = text(pair, "Key")
+            .ok_or_else(|| MgmtError::Xml("correlation property has no key".into()))?;
+        let value = pair
+            .children()
+            .find(|n| n.tag_name().name() == "Value")
+            .ok_or_else(|| MgmtError::Xml(format!("correlation property '{key}' has no value")))?;
+        if is_nil(value) || value.children().any(|n| n.is_element()) {
+            return Err(MgmtError::Xml(format!(
+                "correlation property '{key}' has an unsupported null or structured value"
+            )));
+        }
+        let kind = match qualified_type(value, XSD_NS)? {
+            None => CorrelationPropertyType::String,
+            Some(name) => CorrelationPropertyType::from_xml_name(&name).ok_or_else(|| {
+                MgmtError::Xml(format!(
+                    "correlation property '{key}' has unsupported XML Schema type '{name}'"
+                ))
+            })?,
+        };
+        let value_text: String = value
+            .children()
+            .filter(Node::is_text)
+            .filter_map(|n| n.text())
+            .collect();
+        if kind != CorrelationPropertyType::String {
+            out.types.insert(key.clone(), kind);
+        }
+        out.values.push((key, value_text));
+    }
+    Ok(out)
+}
+
+fn rule_from_entry(
+    entry: Node<'_, '_>,
+    topic: &str,
+    subscription: &str,
+) -> Result<Option<RuleInfo>, MgmtError> {
+    let Some((name, node)) = entry_description(entry, "RuleDescription") else {
+        return Ok(None);
+    };
+    let f = node
+        .children()
+        .find(|n| n.tag_name().name() == "Filter")
+        .ok_or_else(|| MgmtError::Xml(format!("rule '{name}' has no filter")))?;
+    if is_nil(f) {
+        return Err(MgmtError::Xml(format!(
+            "rule '{name}' has an unsupported null filter"
+        )));
+    }
+    let filter = match qualified_type(f, SB_NS)?.as_deref() {
+        Some("SqlFilter") => RuleFilter::Sql {
+            expression: text(f, "SqlExpression").unwrap_or_default(),
+        },
+        Some("CorrelationFilter") => {
+            let properties = correlation_properties(f)?;
+            RuleFilter::Correlation {
                 correlation_id: text(f, "CorrelationId"),
                 message_id: text(f, "MessageId"),
                 to: text(f, "To"),
@@ -301,26 +388,37 @@ fn rule_from_entry(entry: Node<'_, '_>, topic: &str, subscription: &str) -> Opti
                 session_id: text(f, "SessionId"),
                 reply_to_session_id: text(f, "ReplyToSessionId"),
                 content_type: text(f, "ContentType"),
-                properties: f
-                    .descendants()
-                    .filter(|n| n.tag_name().name() == "KeyValueOfstringanyType")
-                    .filter_map(|kv| {
-                        Some((text(kv, "Key")?, text(kv, "Value").unwrap_or_default()))
-                    })
-                    .collect(),
-            },
-            "FalseFilter" => RuleFilter::False,
-            _ => RuleFilter::True,
+                properties: properties.values,
+                property_types: properties.types,
+            }
         }
-    });
+        Some("FalseFilter") => RuleFilter::False,
+        Some("TrueFilter") => RuleFilter::True,
+        kind => {
+            return Err(MgmtError::Xml(format!(
+                "rule '{name}' has unsupported filter type {kind:?}"
+            )));
+        }
+    };
+    filter.validate().map_err(MgmtError::Xml)?;
 
-    let action = node
-        .children()
-        .find(|n| n.tag_name().name() == "Action")
-        .filter(|a| a.attribute((XSI_NS, "type")) == Some("SqlRuleAction"))
-        .and_then(|a| text(a, "SqlExpression"));
+    let action = match node.children().find(|n| n.tag_name().name() == "Action") {
+        None => None,
+        Some(a) if is_nil(a) => None,
+        Some(a) => match qualified_type(a, SB_NS)?.as_deref() {
+            Some("SqlRuleAction") => Some(text(a, "SqlExpression").ok_or_else(|| {
+                MgmtError::Xml(format!("rule '{name}' has a SQL action without expression"))
+            })?),
+            Some("EmptyRuleAction") => None,
+            kind => {
+                return Err(MgmtError::Xml(format!(
+                    "rule '{name}' has unsupported action type {kind:?}"
+                )));
+            }
+        },
+    };
 
-    Some(RuleInfo {
+    Ok(Some(RuleInfo {
         properties: RuleProperties {
             topic: topic.to_owned(),
             subscription: subscription.to_owned(),
@@ -330,7 +428,7 @@ fn rule_from_entry(entry: Node<'_, '_>, topic: &str, subscription: &str) -> Opti
             action,
         },
         created_at: timestamp(node, "CreatedAt"),
-    })
+    }))
 }
 
 pub(crate) fn parse_rule_feed(
@@ -339,10 +437,13 @@ pub(crate) fn parse_rule_feed(
     subscription: &str,
 ) -> Result<Vec<RuleInfo>, MgmtError> {
     let doc = parse_doc(xml)?;
-    Ok(entries(&doc)
-        .into_iter()
-        .filter_map(|e| rule_from_entry(e, topic, subscription))
-        .collect())
+    let mut rules = Vec::new();
+    for entry in entries(&doc) {
+        if let Some(rule) = rule_from_entry(entry, topic, subscription)? {
+            rules.push(rule);
+        }
+    }
+    Ok(rules)
 }
 
 pub(crate) fn parse_rule(
@@ -528,5 +629,72 @@ mod tests {
             }
         );
         assert!(rule.properties.action.is_none());
+    }
+
+    fn correlation_rule(value: &str) -> String {
+        format!(
+            r#"<entry xmlns="http://www.w3.org/2005/Atom"><content>
+        <RuleDescription xmlns="http://schemas.microsoft.com/netservices/2010/10/servicebus/connect"
+          xmlns:i="http://www.w3.org/2001/XMLSchema-instance"
+          xmlns:s="http://schemas.microsoft.com/netservices/2010/10/servicebus/connect"
+          xmlns:x="http://www.w3.org/2001/XMLSchema">
+          <Filter i:type="s:CorrelationFilter"><Properties>
+          <KeyValueOfstringanyType><Key>priority</Key>{value}</KeyValueOfstringanyType>
+          </Properties></Filter><Action i:type="s:EmptyRuleAction"/><Name>routing</Name>
+        </RuleDescription></content></entry>"#
+        )
+    }
+
+    #[test]
+    fn correlation_type_prefix_is_resolved_by_namespace() {
+        let xml = correlation_rule(r#"<Value i:type="x:long">9223372036854775807</Value>"#);
+        let rule = parse_rule(&xml, "events", "audit").unwrap().unwrap();
+        let RuleFilter::Correlation {
+            properties,
+            property_types,
+            ..
+        } = rule.properties.filter
+        else {
+            panic!("expected correlation filter");
+        };
+        assert_eq!(
+            properties,
+            vec![("priority".into(), "9223372036854775807".into())]
+        );
+        assert_eq!(property_types["priority"], CorrelationPropertyType::Long);
+    }
+
+    #[test]
+    fn unsupported_correlation_values_are_errors_not_strings() {
+        for value in [
+            r#"<Value i:type="x:anyType">42</Value>"#,
+            r#"<Value xmlns:z="https://foreign.example/type" i:type="z:long">42</Value>"#,
+            r#"<Value i:type="x:boolean">not a boolean</Value>"#,
+            r#"<Value i:type="x:int">2147483648</Value>"#,
+            r#"<Value i:nil="true"/>"#,
+            r#"<Value i:nil="1"/>"#,
+            r"<Value><Nested>42</Nested></Value>",
+        ] {
+            assert!(
+                matches!(
+                    parse_rule(&correlation_rule(value), "events", "audit"),
+                    Err(MgmtError::Xml(_))
+                ),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_filter_and_action_types_are_not_silently_replaced() {
+        for xml in [
+            RULE_FEED.replace("SqlFilter", "FutureFilter"),
+            RULE_FEED.replace("EmptyRuleAction", "FutureAction"),
+        ] {
+            assert!(matches!(
+                parse_rule_feed(&xml, "events", "audit"),
+                Err(MgmtError::Xml(_))
+            ));
+        }
     }
 }

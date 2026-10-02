@@ -62,9 +62,20 @@ impl SiftMessage {
     /// copy rather than one that still reads as dead-lettered.
     #[must_use]
     pub fn to_outbound(&self) -> OutboundMessage {
+        // Display text may be pretty-printed or decompressed. Resends use
+        // the original payload, while uncompressed UTF-8 remains editable.
+        let original_text = (!self.body.gzipped && self.body.text.is_some())
+            .then(|| std::str::from_utf8(&self.body.bytes).ok())
+            .flatten();
+        let body = original_text
+            .filter(|_| !self.body.bytes.is_empty())
+            .map_or_else(|| self.body.text.clone().unwrap_or_default(), str::to_owned);
+        let raw_bytes = (!self.body.bytes.is_empty()
+            && (self.body.gzipped || self.body.text.is_none() || original_text.is_none()))
+        .then(|| self.body.bytes.clone());
         OutboundMessage {
-            body: self.body.text.clone().unwrap_or_default(),
-            raw_bytes: self.body.text.is_none().then(|| self.body.bytes.clone()),
+            body,
+            raw_bytes,
             message_id: None, // a resent message gets a fresh id
             subject: self.subject.clone(),
             content_type: self.content_type.clone(),
@@ -155,7 +166,7 @@ mod tests {
         assert_eq!(out.subject.as_deref(), Some("subject"));
         assert_eq!(out.application_properties.len(), 1);
         assert!(out.raw_bytes.is_none());
-        assert!(out.body.contains("\"a\": 1"));
+        assert_eq!(out.payload(), br#"{"a":1}"#);
     }
 
     #[test]
@@ -186,5 +197,60 @@ mod tests {
         let out = msg.to_outbound();
         assert_eq!(out.raw_bytes.as_deref(), Some(bytes.as_slice()));
         assert_eq!(out.payload(), bytes);
+    }
+
+    fn message(bytes: Vec<u8>) -> SiftMessage {
+        SiftMessage {
+            sequence_number: 1,
+            message_id: None,
+            subject: None,
+            content_type: None,
+            correlation_id: None,
+            session_id: None,
+            reply_to: None,
+            to: None,
+            enqueued_time: None,
+            expires_at: None,
+            time_to_live: None,
+            delivery_count: None,
+            state: MessageState::Active,
+            lock_token: None,
+            locked_until: None,
+            dead_letter_reason: None,
+            dead_letter_error_description: None,
+            dead_letter_source: None,
+            application_properties: Vec::new(),
+            body: decode(bytes),
+        }
+    }
+
+    #[test]
+    fn text_resends_keep_bom_whitespace_and_line_endings() {
+        for bytes in [
+            b"\xef\xbb\xbf{ \"a\" : 1 }\r\n".to_vec(),
+            b"plain text\r\n  unchanged\t".to_vec(),
+        ] {
+            let outgoing = message(bytes.clone()).to_outbound();
+            assert_eq!(outgoing.payload(), bytes);
+            assert!(
+                outgoing.raw_bytes.is_none(),
+                "uncompressed text remains editable"
+            );
+        }
+    }
+
+    #[test]
+    fn gzip_resends_keep_compression_and_exact_original_bytes() {
+        use std::io::Write as _;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(br#"{"data":"original gzip payload"}"#)
+            .expect("gzip input");
+        let bytes = encoder.finish().expect("gzip finished");
+        let incoming = message(bytes.clone());
+        assert!(incoming.body.gzipped);
+        let outgoing = incoming.to_outbound();
+        assert_eq!(outgoing.raw_bytes.as_deref(), Some(bytes.as_slice()));
+        assert_eq!(outgoing.payload(), bytes);
     }
 }

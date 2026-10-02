@@ -169,14 +169,23 @@ pub enum MutationOp {
     Deleted,
 }
 
-/// A read-only snapshot of one message session: the accepted session's id,
-/// its custom state (decoded for display), and its peeked messages.
+/// One held message session. The lease identifies the receiver, so commands
+/// from an old view can never settle messages on a replacement session.
 #[derive(Debug, Clone)]
 pub struct SessionSnapshot {
+    pub lease_id: Uuid,
     pub session_id: String,
+    pub locked_until: time::OffsetDateTime,
     /// The session's custom state; `None` when unset.
     pub state: Option<DecodedBody>,
     pub messages: Vec<SiftMessage>,
+}
+
+impl SessionSnapshot {
+    #[must_use]
+    pub fn lock_expired(&self, now: time::OffsetDateTime) -> bool {
+        self.locked_until <= now
+    }
 }
 
 /// Where messages are browsed from: an entity's main queue or its
@@ -236,6 +245,11 @@ pub enum Command {
         req: RequestId,
         profile: NamespaceProfile,
         secret: SecretString,
+    },
+    /// Launch Azure CLI browser sign-in, then connect the saved Entra profile.
+    SignIn {
+        req: RequestId,
+        profile: NamespaceProfile,
     },
     Disconnect {
         ns: NamespaceId,
@@ -330,8 +344,7 @@ pub enum Command {
         source: MessageSource,
         sequence_numbers: Vec<i64>,
     },
-    /// Accept a session (next available, or a named one), peek its messages
-    /// and read its state, then release it. Read-only browse.
+    /// Accept and hold a named or next available session, then peek it.
     BrowseSession {
         req: RequestId,
         ns: NamespaceId,
@@ -339,6 +352,37 @@ pub enum Command {
         /// `None` accepts the next available session.
         session_id: Option<String>,
         count: u32,
+    },
+    ReceiveSession {
+        req: RequestId,
+        ns: NamespaceId,
+        source: MessageSource,
+        lease_id: Uuid,
+        count: u32,
+        /// Empty receives active messages; otherwise retrieves deferred ones.
+        sequence_numbers: Vec<i64>,
+    },
+    RenewSession {
+        req: RequestId,
+        ns: NamespaceId,
+        source: MessageSource,
+        lease_id: Uuid,
+        /// `Some` verifies a received delivery is still held. Both renew its
+        /// owning session: Azure session messages share the session lock.
+        lock_token: Option<String>,
+    },
+    SettleSessionMessage {
+        req: RequestId,
+        ns: NamespaceId,
+        source: MessageSource,
+        lease_id: Uuid,
+        lock_token: String,
+        disposition: Disposition,
+    },
+    ReleaseSession {
+        ns: NamespaceId,
+        source: MessageSource,
+        lease_id: Uuid,
     },
     /// Export the namespace's entity descriptions to a JSON file.
     ExportNamespace {
@@ -479,6 +523,15 @@ pub enum Event {
         source: MessageSource,
         result: Result<SessionSnapshot, BackendError>,
     },
+    SessionSettled {
+        req: RequestId,
+        ns: NamespaceId,
+        source: MessageSource,
+        lease_id: Uuid,
+        lock_token: String,
+        disposition: Disposition,
+        result: Result<(), BackendError>,
+    },
 }
 
 /// A user-presentable error from a backend operation.
@@ -497,6 +550,30 @@ impl BackendError {
             message: message.into(),
             detail: None,
         }
+    }
+
+    /// Service Bus reports lock loss in AMQP condition text. These errors
+    /// cannot be retried against the same receiver or delivery.
+    #[must_use]
+    pub fn lock_lost(&self) -> bool {
+        let message = self.message.to_ascii_lowercase();
+        self.session_lock_lost()
+            || message.contains("message-lock-lost")
+            || (message.contains("lock")
+                && (message.contains("expired")
+                    || message.contains("lost")
+                    || message.contains("invalid")))
+            || message.contains("lock is no longer held")
+    }
+
+    #[must_use]
+    pub fn session_lock_lost(&self) -> bool {
+        let message = self.message.to_ascii_lowercase();
+        message.contains("session-lock-lost")
+            || (message.contains("session")
+                && message.contains("lock")
+                && (message.contains("expired") || message.contains("lost")))
+            || message.contains("session is no longer held")
     }
 }
 

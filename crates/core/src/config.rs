@@ -21,6 +21,8 @@ const CONFIG_FILE: &str = "config.toml";
 pub enum ConfigError {
     #[error("could not determine the platform configuration directory")]
     NoConfigDir,
+    #[error("SIFT_CONFIG_DIR must be an absolute directory path; received {0}")]
+    InvalidConfigDir(PathBuf),
     #[error("failed to read {path}: {source}")]
     Io {
         path: PathBuf,
@@ -35,6 +37,14 @@ pub enum ConfigError {
     },
     #[error("failed to serialize configuration: {0}")]
     Serialize(#[from] toml::ser::Error),
+    #[error(
+        "{path} uses unsupported configuration schema {version}; this Sift version supports schema {supported}. Keep this file and use a compatible Sift version"
+    )]
+    UnsupportedVersion {
+        path: PathBuf,
+        version: u32,
+        supported: u32,
+    },
 }
 
 /// How the user authenticates a namespace profile.
@@ -44,7 +54,7 @@ pub enum AuthMethod {
     /// SAS connection string, stored in the secret store under
     /// [`crate::secrets::SecretKind::ConnectionString`].
     ConnectionString,
-    /// Microsoft Entra ID (Azure AD). Wired up in a later phase.
+    /// Microsoft Entra ID through the signed-in Azure CLI account.
     AzureAd {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tenant_id: Option<String>,
@@ -141,7 +151,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: Self::SCHEMA_VERSION,
             ui: UiConfig::default(),
             retry: RetryConfig::default(),
             profiles: Vec::new(),
@@ -150,10 +160,15 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    pub const SCHEMA_VERSION: u32 = 1;
+
     /// Platform path of `config.toml`
     /// (e.g. `%APPDATA%\DeandreT\sift\config\config.toml` on Windows,
     /// `~/.config/sift/config.toml` on Linux).
     pub fn default_path() -> Result<PathBuf, ConfigError> {
+        if let Some(directory) = std::env::var_os("SIFT_CONFIG_DIR") {
+            return overridden_config_path(Path::new(&directory));
+        }
         let dirs = directories::ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
             .ok_or(ConfigError::NoConfigDir)?;
         Ok(dirs.config_dir().join(CONFIG_FILE))
@@ -177,10 +192,7 @@ impl AppConfig {
                 });
             }
         };
-        toml::from_str(&text).map_err(|source| ConfigError::Parse {
-            path: path.to_owned(),
-            source: Box::new(source),
-        })
+        parse_config(&text, path)
     }
 
     /// Save to the default path.
@@ -195,6 +207,16 @@ impl AppConfig {
             path: path.to_owned(),
             source,
         };
+        require_schema(self.schema_version, path)?;
+        // Startup may have fallen back to defaults after rejecting a newer
+        // config. Never let that fallback overwrite the original document.
+        match std::fs::read_to_string(path) {
+            Ok(existing) => {
+                parse_config(&existing, path)?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(io_err(source)),
+        }
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
         std::fs::create_dir_all(dir).map_err(io_err)?;
 
@@ -221,6 +243,51 @@ impl AppConfig {
     }
 }
 
+fn parse_config(text: &str, path: &Path) -> Result<AppConfig, ConfigError> {
+    validate_schema(text, path)?;
+    toml::from_str(text).map_err(|source| ConfigError::Parse {
+        path: path.to_owned(),
+        source: Box::new(source),
+    })
+}
+
+fn overridden_config_path(directory: &Path) -> Result<PathBuf, ConfigError> {
+    if !directory.is_absolute() {
+        return Err(ConfigError::InvalidConfigDir(directory.to_owned()));
+    }
+    Ok(directory.join(CONFIG_FILE))
+}
+
+fn require_schema(version: u32, path: &Path) -> Result<(), ConfigError> {
+    if version != AppConfig::SCHEMA_VERSION {
+        return Err(ConfigError::UnsupportedVersion {
+            path: path.to_owned(),
+            version,
+            supported: AppConfig::SCHEMA_VERSION,
+        });
+    }
+    Ok(())
+}
+
+fn validate_schema(text: &str, path: &Path) -> Result<(), ConfigError> {
+    #[derive(serde::Deserialize)]
+    struct Schema {
+        // Configs from the first preview may omit the version marker.
+        #[serde(default = "current_schema")]
+        schema_version: u32,
+    }
+
+    fn current_schema() -> u32 {
+        AppConfig::SCHEMA_VERSION
+    }
+
+    let schema: Schema = toml::from_str(text).map_err(|source| ConfigError::Parse {
+        path: path.to_owned(),
+        source: Box::new(source),
+    })?;
+    require_schema(schema.schema_version, path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,7 +298,7 @@ mod tests {
         assert_eq!(config.schema_version, 1);
         assert_eq!(config.ui.peek_batch, 100);
         assert!(config.ui.confirm_delete_typed_name);
-        assert!(config.profiles.is_empty());
+        assert_eq!(config.profiles.len(), 0);
     }
 
     #[test]
@@ -258,12 +325,102 @@ mod tests {
     }
 
     #[test]
+    fn config_override_requires_an_absolute_isolated_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            overridden_config_path(dir.path()).unwrap(),
+            dir.path().join("config.toml")
+        );
+        for path in [Path::new(""), Path::new("relative")] {
+            assert!(matches!(
+                overridden_config_path(path),
+                Err(ConfigError::InvalidConfigDir(_))
+            ));
+        }
+    }
+
+    #[test]
     fn unknown_fields_are_tolerated() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "schema_version = 1\nfuture_field = true\n").unwrap();
         let loaded = AppConfig::load_from(&path).unwrap();
         assert_eq!(loaded.schema_version, 1);
+    }
+
+    #[test]
+    fn legacy_config_without_schema_preserves_profile_identity_and_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let id = Uuid::new_v4();
+        std::fs::write(
+            &path,
+            format!("[[profiles]]\nid = '{id}'\nname = 'legacy'\n[profiles.auth]\nkind = 'connection_string'\n"),
+        )
+        .unwrap();
+        let loaded = AppConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.schema_version, AppConfig::SCHEMA_VERSION);
+        assert_eq!(loaded.profiles[0].id, id);
+        assert_eq!(loaded.profiles[0].transport, TransportType::AmqpTcp);
+        assert!(!loaded.profiles[0].auto_connect);
+        loaded.save_to(&path).unwrap();
+        assert_eq!(AppConfig::load_from(&path).unwrap(), loaded);
+    }
+
+    #[test]
+    fn rejects_unsupported_config_without_overwriting_it_after_startup_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "schema_version = 2\nfuture_field = 'preserve this data'\n";
+        std::fs::write(&path, original).unwrap();
+        assert!(matches!(
+            AppConfig::load_from(&path),
+            Err(ConfigError::UnsupportedVersion { version: 2, .. })
+        ));
+        assert!(matches!(
+            AppConfig::default().save_to(&path),
+            Err(ConfigError::UnsupportedVersion { version: 2, .. })
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn semantically_invalid_schema_one_config_is_preserved_after_startup_fallback() {
+        let id = Uuid::new_v4();
+        let documents = [
+            "schema_version = 1\n[ui]\npeek_batch = 'invalid'\n".to_owned(),
+            "schema_version = 1\n[[profiles]]\nid = 'invalid-uuid'\nname = 'keep this profile'\n[profiles.auth]\nkind = 'connection_string'\n".to_owned(),
+            format!("schema_version = 1\n[[profiles]]\nid = '{id}'\nname = 'keep this profile'\n[profiles.auth]\nkind = 'unsupported_authentication'\n"),
+        ];
+        for original in documents {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            std::fs::write(&path, &original).unwrap();
+            assert!(matches!(
+                AppConfig::load_from(&path),
+                Err(ConfigError::Parse { .. })
+            ));
+            assert!(matches!(
+                AppConfig::default().save_to(&path),
+                Err(ConfigError::Parse { .. })
+            ));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_in_memory_schema_without_creating_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let config = AppConfig {
+            schema_version: 0,
+            ..AppConfig::default()
+        };
+        assert!(matches!(
+            config.save_to(&path),
+            Err(ConfigError::UnsupportedVersion { version: 0, .. })
+        ));
+        assert!(!path.exists());
     }
 
     #[test]

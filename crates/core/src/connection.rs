@@ -20,6 +20,39 @@ pub enum TransportType {
     AmqpWebSockets,
 }
 
+/// Normalize a namespace host for Entra ID profiles. Entity paths and URL
+/// credentials are rejected so the profile always addresses one namespace.
+pub fn namespace_endpoint(input: &str) -> Result<Url, String> {
+    let input = input.trim();
+    let value = if input.contains("://") {
+        input.to_owned()
+    } else {
+        format!("sb://{input}")
+    };
+    let endpoint = Url::parse(&value).map_err(|_| "Enter a valid namespace host.".to_owned())?;
+    let host = endpoint.host_str().unwrap_or_default().to_ascii_lowercase();
+    let namespace = host.strip_suffix(".servicebus.windows.net");
+    if !matches!(endpoint.scheme(), "sb" | "https")
+        || namespace.is_none_or(|name| {
+            name.is_empty()
+                || !name
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        })
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.port().is_some()
+        || !matches!(endpoint.path(), "" | "/")
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err(
+            "Enter the namespace host only, for example orders.servicebus.windows.net.".into(),
+        );
+    }
+    Url::parse(&format!("sb://{host}/")).map_err(|_| "Invalid namespace host.".to_owned())
+}
+
 /// Credential material carried by a connection string.
 #[derive(Debug, Clone)]
 pub enum Credential {
@@ -216,6 +249,34 @@ mod tests {
         SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=abc123def456==";
 
     #[test]
+    fn entra_endpoint_normalizes_and_rejects_entity_or_credential_urls() {
+        for input in [
+            "contoso.servicebus.windows.net",
+            "sb://contoso.servicebus.windows.net/",
+            "https://contoso.servicebus.windows.net/",
+        ] {
+            assert_eq!(
+                namespace_endpoint(input).unwrap().as_str(),
+                "sb://contoso.servicebus.windows.net/"
+            );
+        }
+        for input in [
+            "",
+            "localhost",
+            "https://user:secret@contoso.servicebus.windows.net",
+            "sb://contoso.servicebus.windows.net/orders",
+            "sb://contoso.servicebus.windows.net/?token=secret",
+            "http://contoso.servicebus.windows.net",
+            "sb://contoso.servicebus.windows.net:5671/",
+            "sb://arbitrary.example.com/",
+            "sb://servicebus.windows.net/",
+            "sb://contoso.servicebus.windows.net.attacker.example/",
+        ] {
+            assert!(namespace_endpoint(input).is_err(), "accepted {input}");
+        }
+    }
+
+    #[test]
     fn parses_standard_sas_connection_string() {
         let conn = NamespaceConnection::parse(FULL).unwrap();
         assert_eq!(
@@ -225,7 +286,7 @@ mod tests {
         assert_eq!(conn.namespace, "contoso");
         assert_eq!(conn.transport, TransportType::AmqpTcp);
         assert!(conn.entity_path.is_none());
-        assert!(conn.warnings.is_empty());
+        assert_eq!(conn.warnings.len(), 0);
         let Credential::SasKey { key_name, key } = &conn.credential else {
             panic!("expected SasKey credential");
         };

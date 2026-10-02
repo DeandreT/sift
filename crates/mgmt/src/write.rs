@@ -194,6 +194,7 @@ pub(crate) fn rule_body(p: &RuleProperties) -> String {
                 reply_to_session_id,
                 content_type,
                 properties,
+                property_types,
             } => {
                 xml.open("Filter", &[("i:type", "CorrelationFilter")]);
                 xml.leaf_opt("CorrelationId", correlation_id.as_deref());
@@ -209,10 +210,18 @@ pub(crate) fn rule_body(p: &RuleProperties) -> String {
                     for (key, value) in properties {
                         xml.open("KeyValueOfstringanyType", &[]);
                         xml.leaf("Key", key);
+                        let schema_type = format!(
+                            "d6p1:{}",
+                            property_types
+                                .get(key)
+                                .copied()
+                                .unwrap_or_default()
+                                .as_str()
+                        );
                         xml.open(
                             "Value",
                             &[
-                                ("i:type", "d6p1:string"),
+                                ("i:type", &schema_type),
                                 ("xmlns:d6p1", "http://www.w3.org/2001/XMLSchema"),
                             ],
                         );
@@ -317,6 +326,73 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(parsed.properties, props);
+    }
+
+    #[test]
+    fn every_supported_correlation_type_round_trips_without_normalizing_values() {
+        use crate::model::CorrelationPropertyType as Kind;
+        let cases = [
+            (Kind::String, "  literal <value> & text  "),
+            (Kind::Boolean, "1"),
+            (Kind::Byte, "-128"),
+            (Kind::UnsignedByte, "255"),
+            (Kind::Short, "-32768"),
+            (Kind::UnsignedShort, "65535"),
+            (Kind::Int, "-2147483648"),
+            (Kind::UnsignedInt, "4294967295"),
+            (Kind::Long, "-9223372036854775808"),
+            (Kind::UnsignedLong, "18446744073709551615"),
+            (Kind::Decimal, "12345678901234567890.123456789"),
+            (Kind::Float, "1.23E-5"),
+            (Kind::Double, "-INF"),
+            (Kind::DateTime, "2026-10-02T12:34:56.1234567-07:00"),
+            (Kind::Base64Binary, "AAEC/w=="),
+            (Kind::Duration, "-P1Y2M3DT4H5M6.123S"),
+            (Kind::AnyUri, "relative/path?name=value"),
+        ];
+        let properties: Vec<_> = cases
+            .iter()
+            .map(|(kind, value)| (kind.as_str().to_owned(), (*value).to_owned()))
+            .collect();
+        let property_types = cases
+            .iter()
+            .filter(|(kind, _)| *kind != Kind::String)
+            .map(|(kind, _)| (kind.as_str().to_owned(), *kind))
+            .collect();
+        let original = RuleProperties {
+            topic: "events".into(),
+            subscription: "audit".into(),
+            name: "typed-routing".into(),
+            filter: RuleFilter::Correlation {
+                correlation_id: None,
+                message_id: None,
+                to: None,
+                reply_to: None,
+                subject: Some("order".into()),
+                session_id: None,
+                reply_to_session_id: None,
+                content_type: None,
+                properties,
+                property_types,
+            },
+            action: Some("SET origin = 'original'".into()),
+        };
+        original.filter.validate().unwrap();
+        let parsed = atom::parse_rule(&rule_body(&original), "events", "audit")
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.properties, original);
+        let mut edited = parsed.properties;
+        edited.action = Some("SET origin = 'edited'".into());
+        let rewritten = atom::parse_rule(&rule_body(&edited), "events", "audit")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rewritten.properties.filter, original.filter);
+        // A replacement failure restores the same original type metadata.
+        let restored = atom::parse_rule(&rule_body(&original), "events", "audit")
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.properties, original);
     }
 
     #[test]

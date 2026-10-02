@@ -9,7 +9,7 @@ use azservicebus::receiver::DeadLetterOptions;
 use azservicebus::{
     ServiceBusClient, ServiceBusClientOptions, ServiceBusMessage, ServiceBusReceiveMode,
     ServiceBusReceiver, ServiceBusReceiverOptions, ServiceBusSender, ServiceBusSenderOptions,
-    SubQueue,
+    ServiceBusSessionReceiver, SubQueue,
 };
 use fe2o3_amqp_types::messaging::ApplicationProperties;
 use fe2o3_amqp_types::primitives::SimpleValue;
@@ -17,7 +17,50 @@ use sift_core::body::{DecodedBody, decode};
 use sift_core::connection::{NamespaceConnection, TransportType};
 use sift_core::message::{MessageState, OutboundMessage, SiftMessage};
 
-use crate::bridge::{BackendError, Disposition, EntityPath, MessageSource, ReceiveMode};
+use crate::bridge::{
+    BackendError, Disposition, EntityPath, MessageSource, ReceiveMode, SessionSnapshot,
+};
+
+/// A disconnected broker must not leave cleanup holding the namespace mutex.
+const CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+struct HeldSession {
+    lease_id: uuid::Uuid,
+    receiver: ServiceBusSessionReceiver,
+    state: Option<DecodedBody>,
+    locked: HashMap<String, azservicebus::ServiceBusReceivedMessage>,
+    /// Includes peeked rows as well as deliveries held in `locked`.
+    messages: Vec<SiftMessage>,
+}
+
+impl HeldSession {
+    fn check(&self, lease_id: uuid::Uuid) -> Result<(), BackendError> {
+        check_session_lease(
+            self.lease_id,
+            lease_id,
+            self.receiver.session_locked_until(),
+        )
+    }
+
+    fn snapshot(&self) -> SessionSnapshot {
+        let locked_until = self.receiver.session_locked_until();
+        let mut messages = self.messages.clone();
+        // Session deliveries share the session lock. A stale per-message
+        // annotation must not disable settlement after session renewal.
+        for row in &mut messages {
+            if row.lock_token.is_some() {
+                row.locked_until = Some(locked_until);
+            }
+        }
+        SessionSnapshot {
+            lease_id: self.lease_id,
+            session_id: self.receiver.session_id().to_owned(),
+            locked_until,
+            state: self.state.clone(),
+            messages,
+        }
+    }
+}
 
 /// Peek-locked messages waiting for the UI to settle them.
 struct LockedMessage {
@@ -37,9 +80,38 @@ pub struct SbRuntime {
     receivers: HashMap<MessageSource, ServiceBusReceiver>,
     senders: HashMap<String, ServiceBusSender>,
     locked: HashMap<String, LockedMessage>,
+    sessions: HashMap<MessageSource, HeldSession>,
+    shutting_down: bool,
 }
 
 impl SbRuntime {
+    pub async fn connect_entra(
+        namespace: &str,
+        transport: TransportType,
+        credential: std::sync::Arc<dyn azure_core::credentials::TokenCredential>,
+    ) -> Result<Self, BackendError> {
+        let options = ServiceBusClientOptions {
+            transport_type: match transport {
+                TransportType::AmqpTcp => azservicebus::ServiceBusTransportType::AmqpTcp,
+                TransportType::AmqpWebSockets => {
+                    azservicebus::ServiceBusTransportType::AmqpWebSocket
+                }
+            },
+            ..Default::default()
+        };
+        let client = ServiceBusClient::new_from_token_credential(namespace, credential, options)
+            .await
+            .map_err(amqp_err)?;
+        Ok(Self {
+            client,
+            receivers: HashMap::new(),
+            senders: HashMap::new(),
+            locked: HashMap::new(),
+            sessions: HashMap::new(),
+            shutting_down: false,
+        })
+    }
+
     pub async fn connect(conn: &NamespaceConnection) -> Result<Self, BackendError> {
         let options = ServiceBusClientOptions {
             transport_type: match conn.transport {
@@ -59,6 +131,8 @@ impl SbRuntime {
             receivers: HashMap::new(),
             senders: HashMap::new(),
             locked: HashMap::new(),
+            sessions: HashMap::new(),
+            shutting_down: false,
         })
     }
 
@@ -66,13 +140,25 @@ impl SbRuntime {
     /// dropped (the client's `dispose` consumes `self`, which a shared
     /// runtime cannot give up while operations may still hold the mutex).
     pub async fn shutdown(&mut self) {
+        self.shutting_down = true;
         self.locked.clear();
+        let mut closing = tokio::task::JoinSet::new();
+        for (_, held) in std::mem::take(&mut self.sessions) {
+            closing.spawn(async move {
+                let _ = tokio::time::timeout(CLOSE_WAIT, held.receiver.dispose()).await;
+            });
+        }
         for (_, receiver) in std::mem::take(&mut self.receivers) {
-            let _ = receiver.dispose().await;
+            closing.spawn(async move {
+                let _ = tokio::time::timeout(CLOSE_WAIT, receiver.dispose()).await;
+            });
         }
         for (_, sender) in std::mem::take(&mut self.senders) {
-            let _ = sender.dispose().await;
+            closing.spawn(async move {
+                let _ = tokio::time::timeout(CLOSE_WAIT, sender.dispose()).await;
+            });
         }
+        while closing.join_next().await.is_some() {}
     }
 
     /// Peek without consuming. `from_seq` is the starting sequence number;
@@ -261,17 +347,28 @@ impl SbRuntime {
         Ok(out)
     }
 
-    /// Accept a session (next available, or a named one), peek its messages
-    /// and read its state, then release it. Read-only: the session receiver is
-    /// dropped at the end, releasing the session lock for other consumers.
+    /// Replace any existing held session, then accept and retain its receiver.
     pub async fn browse_session(
         &mut self,
         source: &MessageSource,
         session_id: Option<String>,
         count: u32,
-    ) -> Result<crate::bridge::SessionSnapshot, BackendError> {
+    ) -> Result<SessionSnapshot, BackendError> {
         use azservicebus::ServiceBusSessionReceiverOptions;
 
+        if self.shutting_down {
+            return Err(BackendError::new("this namespace has disconnected"));
+        }
+        if source.dead_letter {
+            return Err(BackendError::new(
+                "sessions use the main entity; browse dead-letter messages from the dead-letter page",
+            ));
+        }
+        if let Some(old) = self.sessions.remove(source) {
+            tokio::time::timeout(CLOSE_WAIT, old.receiver.dispose()).await
+                .map_err(|_| BackendError::new("Session release timed out. Wait for its lock to expire, then accept it again."))?
+                .map_err(amqp_err)?;
+        }
         let options = ServiceBusSessionReceiverOptions::default();
         let mut receiver = match (&source.entity, session_id) {
             (EntityPath::Queue(name), Some(id)) => self
@@ -302,11 +399,13 @@ impl SbRuntime {
             }
         };
 
-        let session_id = receiver.session_id().to_owned();
-        let peeked = receiver
-            .peek_messages(count, Some(0))
-            .await
-            .map_err(amqp_err)?;
+        let peeked = match receiver.peek_messages(count.clamp(1, 1000), Some(0)).await {
+            Ok(messages) => messages,
+            Err(e) => {
+                let _ = tokio::time::timeout(CLOSE_WAIT, receiver.dispose()).await;
+                return Err(amqp_err(e));
+            }
+        };
         let messages = peeked.iter().map(from_peeked).collect();
         let state = match receiver.session_state().await {
             Ok(bytes) if bytes.is_empty() => None,
@@ -316,18 +415,196 @@ impl SbRuntime {
                 None
             }
         };
-        // Dropping the receiver releases the session lock.
-        let _ = receiver.dispose().await;
-
-        Ok(crate::bridge::SessionSnapshot {
-            session_id,
+        let held = HeldSession {
+            lease_id: uuid::Uuid::new_v4(),
+            receiver,
             state,
+            locked: HashMap::new(),
             messages,
-        })
+        };
+        let snapshot = held.snapshot();
+        self.sessions.insert(source.clone(), held);
+        Ok(snapshot)
+    }
+
+    pub async fn receive_session(
+        &mut self,
+        source: &MessageSource,
+        lease_id: uuid::Uuid,
+        count: u32,
+        sequence_numbers: Vec<i64>,
+        max_wait: std::time::Duration,
+    ) -> Result<SessionSnapshot, BackendError> {
+        let result = self
+            .receive_session_inner(source, lease_id, count, sequence_numbers, max_wait)
+            .await;
+        self.release_lost_session(source, lease_id, &result).await;
+        result
+    }
+
+    async fn receive_session_inner(
+        &mut self,
+        source: &MessageSource,
+        lease_id: uuid::Uuid,
+        count: u32,
+        sequence_numbers: Vec<i64>,
+        max_wait: std::time::Duration,
+    ) -> Result<SessionSnapshot, BackendError> {
+        let held = self.held_session(source, lease_id)?;
+        let batch = if sequence_numbers.is_empty() {
+            held.receiver
+                .receive_messages_with_max_wait_time(count.clamp(1, 1000), max_wait)
+                .await
+        } else {
+            held.receiver
+                .receive_deferred_messages(sequence_numbers.into_iter())
+                .await
+        }
+        .map_err(amqp_err)?;
+        for message in batch {
+            let mut row = from_received(&message);
+            let token = uuid::Uuid::from_bytes(*message.lock_token().as_inner()).to_string();
+            row.lock_token = Some(token.clone());
+            // Receiving a peeked row upgrades it into a settleable delivery.
+            held.messages
+                .retain(|m| m.sequence_number != row.sequence_number);
+            held.locked
+                .retain(|_, delivery| delivery.sequence_number() != row.sequence_number);
+            held.messages.push(row);
+            held.locked.insert(token, message);
+        }
+        held.messages.sort_by_key(|m| m.sequence_number);
+        Ok(held.snapshot())
+    }
+
+    pub async fn renew_session(
+        &mut self,
+        source: &MessageSource,
+        lease_id: uuid::Uuid,
+        lock_token: Option<String>,
+    ) -> Result<SessionSnapshot, BackendError> {
+        let result = self.renew_session_inner(source, lease_id, lock_token).await;
+        self.release_lost_session(source, lease_id, &result).await;
+        result
+    }
+
+    async fn renew_session_inner(
+        &mut self,
+        source: &MessageSource,
+        lease_id: uuid::Uuid,
+        lock_token: Option<String>,
+    ) -> Result<SessionSnapshot, BackendError> {
+        let held = self.held_session(source, lease_id)?;
+        if lock_token
+            .as_deref()
+            .is_some_and(|token| !held.locked.contains_key(token))
+        {
+            return Err(BackendError::new("the message lock is no longer held"));
+        }
+        // Azure locks session messages at the session level. The normal
+        // message-renewal operation is invalid on a session entity, even
+        // though azservicebus exposes it on its session receiver.
+        held.receiver.renew_session_lock().await.map_err(amqp_err)?;
+        Ok(held.snapshot())
+    }
+
+    pub async fn settle_session(
+        &mut self,
+        source: &MessageSource,
+        lease_id: uuid::Uuid,
+        token: &str,
+        disposition: Disposition,
+    ) -> Result<(), BackendError> {
+        let result = self
+            .settle_session_inner(source, lease_id, token, disposition)
+            .await;
+        self.release_lost_session(source, lease_id, &result).await;
+        result
+    }
+
+    async fn settle_session_inner(
+        &mut self,
+        source: &MessageSource,
+        lease_id: uuid::Uuid,
+        token: &str,
+        disposition: Disposition,
+    ) -> Result<(), BackendError> {
+        let held = self.held_session(source, lease_id)?;
+        let message = held
+            .locked
+            .get(token)
+            .ok_or_else(|| BackendError::new("the message lock is no longer held"))?;
+        let result = match disposition {
+            Disposition::Complete => held.receiver.complete_message(message).await,
+            Disposition::Abandon => held.receiver.abandon_message(message, None).await,
+            Disposition::Defer => held.receiver.defer_message(message, None).await,
+            Disposition::DeadLetter {
+                reason,
+                description,
+            } => {
+                held.receiver
+                    .dead_letter_message(
+                        message,
+                        DeadLetterOptions {
+                            dead_letter_reason: reason,
+                            dead_letter_error_description: description,
+                            properties_to_modify: None,
+                        },
+                    )
+                    .await
+            }
+        }
+        .map_err(amqp_err);
+        // Keep retryable deliveries. Lock-loss errors must never offer retry.
+        if result.is_ok() || result.as_ref().is_err_and(BackendError::lock_lost) {
+            held.locked.remove(token);
+            held.messages
+                .retain(|row| row.lock_token.as_deref() != Some(token));
+        }
+        result
+    }
+
+    fn held_session(
+        &mut self,
+        source: &MessageSource,
+        lease_id: uuid::Uuid,
+    ) -> Result<&mut HeldSession, BackendError> {
+        let held = self
+            .sessions
+            .get_mut(source)
+            .ok_or_else(|| BackendError::new("the session is no longer held; accept it again"))?;
+        held.check(lease_id)?;
+        Ok(held)
+    }
+
+    async fn release_lost_session<T>(
+        &mut self,
+        source: &MessageSource,
+        lease_id: uuid::Uuid,
+        result: &Result<T, BackendError>,
+    ) {
+        if result.as_ref().is_err_and(BackendError::session_lock_lost) {
+            self.release_session(source, lease_id).await;
+        }
+    }
+
+    /// Lease-checked release is idempotent, including for late UI responses.
+    pub async fn release_session(&mut self, source: &MessageSource, lease_id: uuid::Uuid) {
+        if self
+            .sessions
+            .get(source)
+            .is_some_and(|held| held.lease_id == lease_id)
+            && let Some(held) = self.sessions.remove(source)
+        {
+            let _ = tokio::time::timeout(CLOSE_WAIT, held.receiver.dispose()).await;
+        }
     }
 
     /// Get (or open) the sender for a queue or topic.
     async fn sender(&mut self, target: &EntityPath) -> Result<&mut ServiceBusSender, BackendError> {
+        if self.shutting_down {
+            return Err(BackendError::new("this namespace has disconnected"));
+        }
         let path = match target {
             EntityPath::Queue(name) | EntityPath::Topic(name) => name.clone(),
             other => {
@@ -357,6 +634,9 @@ impl SbRuntime {
         &mut self,
         source: &MessageSource,
     ) -> Result<&mut ServiceBusReceiver, BackendError> {
+        if self.shutting_down {
+            return Err(BackendError::new("this namespace has disconnected"));
+        }
         if !self.receivers.contains_key(source) {
             let options = ServiceBusReceiverOptions {
                 receive_mode: ServiceBusReceiveMode::PeekLock,
@@ -398,6 +678,24 @@ impl SbRuntime {
 
 fn amqp_err(e: impl std::fmt::Display) -> BackendError {
     BackendError::new(e.to_string())
+}
+
+fn check_session_lease(
+    actual: uuid::Uuid,
+    expected: uuid::Uuid,
+    locked_until: time::OffsetDateTime,
+) -> Result<(), BackendError> {
+    if actual != expected {
+        return Err(BackendError::new(
+            "the session is no longer held; accept it again",
+        ));
+    }
+    if locked_until <= time::OffsetDateTime::now_utc() {
+        return Err(BackendError::new(
+            "the session lock expired; accept the session again",
+        ));
+    }
+    Ok(())
 }
 
 fn decoded_body(
@@ -535,4 +833,40 @@ fn to_service_bus_message(out: &OutboundMessage) -> Result<ServiceBusMessage, Ba
         *message.application_properties_mut() = Some(props);
     }
     Ok(message)
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    #[test]
+    fn stale_session_commands_cannot_act_on_replacement_receiver() {
+        let current = uuid::Uuid::new_v4();
+        let old = uuid::Uuid::new_v4();
+        let future = time::OffsetDateTime::now_utc() + time::Duration::minutes(1);
+        assert!(check_session_lease(current, current, future).is_ok());
+        let error = check_session_lease(current, old, future).expect_err("stale lease rejected");
+        assert!(error.session_lock_lost());
+    }
+
+    #[test]
+    fn session_deadline_rejects_operations_before_contacting_broker() {
+        let lease = uuid::Uuid::new_v4();
+        let past = time::OffsetDateTime::now_utc() - time::Duration::seconds(1);
+        let error = check_session_lease(lease, lease, past).expect_err("expired lock rejected");
+        assert!(error.session_lock_lost());
+    }
+
+    #[test]
+    fn lock_loss_is_distinct_from_retryable_transport_errors() {
+        assert!(BackendError::new("com.microsoft:session-lock-lost").session_lock_lost());
+        assert!(
+            BackendError::new("The session lock was lost. Request a new session.")
+                .session_lock_lost()
+        );
+        assert!(BackendError::new("The lock supplied is invalid. Either the lock expired, or the message has already been removed.").lock_lost());
+        assert!(BackendError::new("com.microsoft:message-lock-lost").lock_lost());
+        assert!(!BackendError::new("com.microsoft:message-lock-lost").session_lock_lost());
+        assert!(!BackendError::new("connection interrupted").lock_lost());
+    }
 }

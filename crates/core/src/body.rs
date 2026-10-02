@@ -3,6 +3,46 @@
 
 use std::io::Read as _;
 
+/// Maximum text passed to an inline editor or highlighted preview at once.
+/// The complete payload remains available for paging, copying, and sending.
+pub const MAX_INLINE_TEXT_BYTES: usize = 32 * 1024;
+
+/// A borrowed prefix, capped in bytes without splitting a UTF-8 character.
+#[must_use]
+pub fn bounded_text(text: &str, max_bytes: usize) -> &str {
+    let mut end = text.len().min(max_bytes);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// Classify text without allocating a JSON tree or a formatted copy.
+/// Used when importing text payloads whose exact bytes will be sent.
+#[must_use]
+pub fn text_format(text: &str) -> BodyFormat {
+    if looks_binary(text) {
+        return BodyFormat::Binary;
+    }
+    let trimmed = text.trim_start_matches('\u{feff}').trim_start();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        let mut decoder = serde_json::Deserializer::from_str(trimmed);
+        if <serde::de::IgnoredAny as serde::Deserialize>::deserialize(&mut decoder).is_ok()
+            && decoder.end().is_ok()
+        {
+            return BodyFormat::Json;
+        }
+    }
+    if trimmed.starts_with('<') {
+        return BodyFormat::Xml;
+    }
+    if text.is_empty() {
+        BodyFormat::Empty
+    } else {
+        BodyFormat::Text
+    }
+}
+
 /// What the decoder concluded about a body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyFormat {
@@ -34,7 +74,8 @@ impl BodyFormat {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedBody {
     pub format: BodyFormat,
-    /// Present for text-like formats; JSON is pretty-printed.
+    /// Present for text-like formats; small JSON is pretty-printed, while
+    /// large JSON retains its source text for bounded display.
     pub text: Option<String>,
     /// The original (pre-gzip-decompression) bytes.
     pub bytes: Vec<u8>,
@@ -149,6 +190,12 @@ fn classify(bytes: &[u8]) -> (BodyFormat, Option<String>) {
     };
     if looks_binary(text) {
         return (BodyFormat::Binary, None);
+    }
+
+    // Large JSON is validated by a streaming visitor and displayed verbatim.
+    // Building/pretty-printing a Value can multiply memory and text layout.
+    if text.len() > MAX_INLINE_TEXT_BYTES {
+        return (text_format(text), Some(text.to_owned()));
     }
 
     let trimmed = text.trim_start();
@@ -310,5 +357,22 @@ mod tests {
     fn hex_dump_truncates() {
         let dump = hex_dump(&[0u8; 64], 32);
         assert!(dump.contains("… 32 more bytes"));
+    }
+
+    #[test]
+    fn large_json_is_validated_without_expanding_or_changing_its_text() {
+        let text = format!("{{\"data\":\"{}\"}}", "x".repeat(1_400_000));
+        let decoded = decode(text.clone().into_bytes());
+        assert_eq!(decoded.format, BodyFormat::Json);
+        assert_eq!(decoded.text.as_deref(), Some(text.as_str()));
+        assert_eq!(decoded.bytes, text.as_bytes());
+        assert_eq!(text_format(&(text + "trailing garbage")), BodyFormat::Text);
+    }
+
+    #[test]
+    fn bounded_preview_respects_utf8_boundaries() {
+        assert_eq!(bounded_text("a🦀b", 4), "a");
+        assert_eq!(bounded_text("a🦀b", 5), "a🦀");
+        assert_eq!(bounded_text("a🦀b", 0), "");
     }
 }

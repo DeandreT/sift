@@ -18,9 +18,10 @@ uuid.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 azservicebus.workspace = true
+azure_core.workspace = true
 crossbeam-channel.workspace = true
 fe2o3-amqp-types = "0.14"
-tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "macros", "process", "rt-multi-thread", "sync", "time"] }
 tokio-util.workspace = true
 
 [lints]

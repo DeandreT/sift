@@ -1,0 +1,56 @@
+name: Live Service Bus validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      allow_mutation:
+        description: "Create and delete sift-test-* entities in the configured disposable namespace"
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  live:
+    name: Live validation on ${{ matrix.os }}
+    environment: live-validation
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Require a disposable namespace and mutation opt-in
+        env:
+          ALLOW_MUTATION: ${{ inputs.allow_mutation }}
+          TEST_CONNECTION_STRING: ${{ secrets.SIFT_TEST_SB_CONNECTION_STRING }}
+        run: |
+          if [[ "$ALLOW_MUTATION" != "true" || -z "$TEST_CONNECTION_STRING" ]]; then
+            echo "Configure SIFT_TEST_SB_CONNECTION_STRING in the live-validation environment and enable allow_mutation."
+            exit 1
+          fi
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - uses: actions-rust-lang/setup-rust-toolchain@ac90e63697ac2784f4ecfe2964e1a285c304003a # v1.14.1
+      - name: Exercise management and messaging against Azure
+        env:
+          SIFT_TEST_SB_CONNECTION_STRING: ${{ secrets.SIFT_TEST_SB_CONNECTION_STRING }}
+          SIFT_TEST_SB_MUTATE: "1"
+        run: |
+          cargo test --locked -p sift-mgmt --test live -- --test-threads=1
+          cargo test --locked -p sift-backend --tests -- --test-threads=1

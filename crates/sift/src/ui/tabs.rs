@@ -76,6 +76,19 @@ impl egui_dock::TabViewer for TabViewerCtx<'_> {
     fn closeable(&mut self, tab: &mut TabId) -> bool {
         !matches!(tab, TabId::Welcome)
     }
+
+    fn on_close(&mut self, tab: &mut TabId) -> egui_dock::widgets::tab_viewer::OnCloseResponse {
+        if let TabId::Entity(scoped) = tab {
+            self.actions.push(AppAction::ReleaseSession {
+                ns: scoped.ns,
+                source: MessageSource {
+                    entity: scoped.path.clone(),
+                    dead_letter: false,
+                },
+            });
+        }
+        egui_dock::widgets::tab_viewer::OnCloseResponse::Close
+    }
 }
 
 impl TabViewerCtx<'_> {
@@ -152,6 +165,7 @@ fn render_entity_inner<S: std::hash::BuildHasher>(
         }
         _ => false,
     };
+    let previous_page = state.page;
     ui.horizontal(|ui| {
         if message_pages {
             let dlq_count = match &state.info {
@@ -192,6 +206,15 @@ fn render_entity_inner<S: std::hash::BuildHasher>(
             }
         });
     });
+    if previous_page == EntityPage::Sessions && state.page != EntityPage::Sessions {
+        actions.push(AppAction::ReleaseSession {
+            ns,
+            source: MessageSource {
+                entity: path.clone(),
+                dead_letter: false,
+            },
+        });
+    }
     ui.separator();
 
     match state.page {
@@ -247,5 +270,33 @@ fn overview(
         Loadable::Loaded(info) => {
             entity_view::show(ui, scoped.ns, info, actions);
         }
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use egui_dock::TabViewer;
+
+    #[test]
+    fn closing_entity_tab_requests_session_release() {
+        let scoped = ScopedEntity::new(uuid::Uuid::new_v4(), EntityPath::Queue("orders".into()));
+        let mut entities = HashMap::new();
+        let mut actions = Vec::new();
+        let mut dashboard = DashboardState::default();
+        let mut viewer = TabViewerCtx {
+            connections: &[],
+            dashboard: &mut dashboard,
+            entities: &mut entities,
+            peek_batch: 10,
+            actions: &mut actions,
+        };
+        assert_eq!(
+            viewer.on_close(&mut TabId::Entity(scoped.clone())),
+            egui_dock::widgets::tab_viewer::OnCloseResponse::Close
+        );
+        assert!(
+            matches!(&actions[..], [AppAction::ReleaseSession { ns, source }] if *ns == scoped.ns && source.entity == scoped.path && !source.dead_letter)
+        );
     }
 }

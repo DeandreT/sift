@@ -33,6 +33,9 @@ lucide-icons = "1.26"
 
 # Azure Service Bus AMQP runtime (community crate; no official SDK exists)
 azservicebus = { version = "0.25", default-features = false, features = ["rustls"] }
+azure_core = { version = "0.25", default-features = false }
+azure_identity = { version = "0.25", default-features = false }
+async-trait = "0.1"
 
 # Async runtime and channels
 crossbeam-channel = "0.5"

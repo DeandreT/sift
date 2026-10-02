@@ -10,8 +10,12 @@ pub enum MgmtError {
         "unauthorized: check the SAS key or credential (clock skew also invalidates SAS tokens)"
     )]
     Unauthorized { detail: String },
-    #[error("forbidden: the credential is valid but lacks Manage rights")]
+    #[error(
+        "forbidden: the credential lacks management permissions; use a SAS policy with Manage rights or the Azure Service Bus Data Owner role for Entra ID"
+    )]
     Forbidden { detail: String },
+    #[error("authentication failed: {0}")]
+    Authentication(String),
     #[error("'{path}' was not found")]
     NotFound { path: String },
     #[error("conflict: the entity already exists or a conflicting operation is in progress")]

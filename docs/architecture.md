@@ -46,7 +46,7 @@ accidentally writing credentials through the config model harder.
 
 The management crate owns the Azure Service Bus namespace management protocol:
 
-- HTTPS requests authenticated with SAS
+- HTTPS requests authenticated with SAS or refreshable Entra bearer credentials
 - paginated queue and topic feeds
 - subscription and rule enumeration
 - entity detail and runtime-count parsing
@@ -154,19 +154,29 @@ two simultaneous connections from colliding.
 ## Connection Lifecycle
 
 1. The UI loads a `NamespaceProfile` from `config.toml`.
-2. It resolves the connection string through `SecretStore`.
-3. `NamespaceConnection` validates and normalizes the string, retaining the
-   original only inside a redacted secret wrapper.
+2. For SAS, it resolves the connection string through `SecretStore`.
+3. `NamespaceConnection` validates and normalizes SAS strings, retaining the
+   original only inside a redacted secret wrapper. For Entra ID, the backend
+   validates the public Azure namespace host and builds a tenant-aware Azure
+   CLI credential. Explicit sign-in opens Azure CLI's browser flow.
 4. The backend builds a management client and validates access with
    `GET /$namespaceinfo`.
-5. A successful connection stores the profile, parsed connection, management
-   client, and an empty AMQP runtime slot.
+5. A successful connection stores its management client, messaging connection
+   settings, and an empty AMQP runtime slot. Entra management and messaging
+   share a credential that caches tokens and refreshes near expiry.
 6. AMQP is established lazily on the first messaging command.
-7. Disconnect removes the namespace context and drops its clients.
+7. Disconnect cancels pending connection attempts, removes the namespace
+   context, and closes its links. Request generation checks prevent late
+   connections or AMQP creation from reattaching to a replaced namespace.
 
 The management client signs each resource URI independently. SAS keys are used
 to mint cached, resource-specific tokens; a pre-signed SAS token is passed
 through as provided.
+
+Entra requests use `https://servicebus.azure.net/.default` for both protocols.
+Credential acquisition has a timeout, external-tool output is redacted from
+operator errors, and bearer tokens remain in memory. Azure CLI owns persisted
+account credentials outside Sift configuration.
 
 ## Management Flow
 
@@ -188,6 +198,12 @@ flowchart LR
 Entity mutations return the refreshed entity when Azure supplies it. The app
 then updates open tabs and reloads the affected parent list. Errors retain a
 short operator-facing message plus optional raw service detail for diagnostics.
+
+Property edit forms begin with the complete server description, preserving
+fields outside the form. Validation and service errors keep edits available;
+request IDs prevent stale save results from closing a newer edit dialog. Rule
+changes explicitly replace the existing rule, snapshot its properties first,
+and attempt restoration if the replacement is rejected.
 
 Namespace exports walk parents before children and serialize descriptions for
 queues, topics, subscriptions, and rules. Imports preserve that ordering so
@@ -223,14 +239,28 @@ counts, enqueue timestamps, and dead-letter metadata are intentionally omitted.
 Raw payload export bypasses the envelope and writes the preserved data-section
 bytes directly.
 
+Bodies larger than 32 KiB are displayed and edited in UTF-8-safe pages. Import
+classifies large JSON with a streaming visitor instead of allocating a JSON
+tree and pretty-printed copy. Message inspection borrows the original body and
+caches Base64 previews; large Base64 decoding is an explicit one-time action.
+A bounded editor layouter also prevents a huge paste from laying out the whole
+insertion in its first frame. Complete payloads remain available to send, copy,
+export, and save as templates.
+
 Peek-lock receives return a lock token to the UI. Complete, abandon, defer, and
 dead-letter commands send that token back to the backend. Receive-and-delete is
 separate and is presented as a destructive action. Deferred retrieval and
 scheduled cancellation use Service Bus sequence numbers.
 
-Session browsing intentionally has a narrow contract: accept the next or named
-session, read its custom state, peek a bounded message set, and release the
-session lock. Session settlement is not currently exposed.
+Session browsing accepts the next or named session, reads its state, and keeps
+the session receiver in a namespace-scoped registry. Each accepted receiver has
+a unique lease ID so delayed commands cannot settle messages on a replacement
+receiver. Session actions receive locked messages, retrieve deferred messages,
+settle deliveries, and renew their shared session lock. A delivery-specific
+renewal verifies the token and renews that same session lock. Expired locks become
+visible errors. Explicit release, view closure, disconnect, and application
+shutdown close retained receivers; stale acceptance responses release orphaned
+leases.
 
 ## Long-Running Operations
 
@@ -251,6 +281,7 @@ file and rename. It stores:
 - retry settings
 - saved namespace profile metadata
 - transport and auto-connect choices
+- authentication method, Entra tenant selection, and namespace endpoints
 
 Connection strings and keys are stored separately under a profile UUID in the
 platform credential store:
@@ -258,6 +289,13 @@ platform credential store:
 - Windows Credential Manager
 - macOS Keychain
 - Linux Secret Service
+
+Entra sign-in material is managed by Azure CLI. Sift does not persist bearer
+tokens or copy CLI account data into its configuration. Config loading and
+saving reject unsupported schema versions, including writes after fallback to
+defaults, so an older application cannot overwrite a newer configuration.
+Namespace import also rejects unsupported export versions before contacting
+Azure or changing any entity.
 
 A startup probe selects the platform keyring or a session-only in-memory
 fallback. Secrets are redacted in debug output and zeroized when their owned
@@ -286,11 +324,21 @@ Live tests are opt-in:
 
 - `SIFT_TEST_SB_CONNECTION_STRING` enables read-only namespace checks.
 - `SIFT_TEST_SB_MUTATE=1` enables entity and messaging scenarios.
+- Property editing, rule restoration, and session lifecycle have dedicated
+  backend integration scenarios.
+- `SIFT_TEST_ENTRA_NAMESPACE` and optional `SIFT_TEST_ENTRA_TENANT` exercise
+  Entra management and, with mutation enabled, AMQP messaging through Azure CLI.
 - Mutating tests create UUID-qualified `sift-test-*` entities and remove them
   when complete.
 
 CI runs formatting, Clippy with warnings denied, unit/integration tests, and a
 workspace build on both Linux and Windows.
+
+The desktop release workflow packages versioned Windows and Linux archives,
+verifies checksums and extracted executable startup, and checks that a desktop
+window opens. Tagged builds create draft preview releases. Real Azure and
+interactive desktop validation remain separate release gates documented in
+[Release Validation](release-validation.md).
 
 ## Adding a Capability
 

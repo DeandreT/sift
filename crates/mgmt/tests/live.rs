@@ -27,7 +27,7 @@ async fn live_read_only() {
     };
 
     let info = client.get_namespace_info().await.expect("namespace info");
-    assert!(!info.name.is_empty());
+    assert_ne!(info.name, "");
 
     let queues = client.list_queues().await.expect("list queues");
     let topics = client.list_topics().await.expect("list topics");

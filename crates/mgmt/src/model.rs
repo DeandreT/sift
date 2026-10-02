@@ -6,6 +6,7 @@ use std::fmt;
 use std::time::Duration;
 
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 /// The `.NET TimeSpan.MaxValue` sentinel the service uses for "unlimited"
 /// durations. Round-tripped verbatim: anything at or above it formats back to
@@ -348,7 +349,170 @@ pub struct SubscriptionInfo {
 // ---------------------------------------------------------------------------
 // Rule
 
+/// XML Schema primitive types supported by correlation property values.
+/// Values retain their original XML text so edits and rollback do not change
+/// numeric precision, boolean spelling, or timestamp offsets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CorrelationPropertyType {
+    #[default]
+    String,
+    Boolean,
+    Byte,
+    UnsignedByte,
+    Short,
+    UnsignedShort,
+    Int,
+    UnsignedInt,
+    Long,
+    UnsignedLong,
+    Decimal,
+    Float,
+    Double,
+    DateTime,
+    Base64Binary,
+    Duration,
+    #[serde(rename = "anyURI")]
+    AnyUri,
+}
+
+impl CorrelationPropertyType {
+    pub const ALL: [Self; 17] = [
+        Self::String,
+        Self::Boolean,
+        Self::Byte,
+        Self::UnsignedByte,
+        Self::Short,
+        Self::UnsignedShort,
+        Self::Int,
+        Self::UnsignedInt,
+        Self::Long,
+        Self::UnsignedLong,
+        Self::Decimal,
+        Self::Float,
+        Self::Double,
+        Self::DateTime,
+        Self::Base64Binary,
+        Self::Duration,
+        Self::AnyUri,
+    ];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::String => "string",
+            Self::Boolean => "boolean",
+            Self::Byte => "byte",
+            Self::UnsignedByte => "unsignedByte",
+            Self::Short => "short",
+            Self::UnsignedShort => "unsignedShort",
+            Self::Int => "int",
+            Self::UnsignedInt => "unsignedInt",
+            Self::Long => "long",
+            Self::UnsignedLong => "unsignedLong",
+            Self::Decimal => "decimal",
+            Self::Float => "float",
+            Self::Double => "double",
+            Self::DateTime => "dateTime",
+            Self::Base64Binary => "base64Binary",
+            Self::Duration => "duration",
+            Self::AnyUri => "anyURI",
+        }
+    }
+
+    #[must_use]
+    pub fn from_xml_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == name)
+    }
+
+    /// Validate supported XML Schema lexical forms without normalizing the
+    /// stored value. Precision and original spelling remain unchanged.
+    #[must_use]
+    pub fn accepts(self, value: &str) -> bool {
+        use base64::Engine as _;
+        let lexical = value.trim();
+        match self {
+            Self::String => true,
+            Self::Boolean => matches!(lexical, "true" | "false" | "1" | "0"),
+            Self::Byte => lexical.parse::<i8>().is_ok(),
+            Self::UnsignedByte => lexical.parse::<u8>().is_ok(),
+            Self::Short => lexical.parse::<i16>().is_ok(),
+            Self::UnsignedShort => lexical.parse::<u16>().is_ok(),
+            Self::Int => lexical.parse::<i32>().is_ok(),
+            Self::UnsignedInt => lexical.parse::<u32>().is_ok(),
+            Self::Long => lexical.parse::<i64>().is_ok(),
+            Self::UnsignedLong => lexical.parse::<u64>().is_ok(),
+            Self::Decimal => {
+                let number = lexical.strip_prefix(['+', '-']).unwrap_or(lexical);
+                !number.is_empty()
+                    && number.bytes().any(|b| b.is_ascii_digit())
+                    && number.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+                    && number.bytes().filter(|b| *b == b'.').count() <= 1
+            }
+            Self::Float | Self::Double => {
+                matches!(lexical, "INF" | "-INF" | "NaN")
+                    || (lexical.bytes().any(|b| b.is_ascii_digit())
+                        && lexical.bytes().all(|b| {
+                            b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.' | b'e' | b'E')
+                        })
+                        && lexical.parse::<f64>().is_ok())
+            }
+            Self::DateTime => {
+                let utc = format!("{lexical}Z");
+                OffsetDateTime::parse(lexical, &Rfc3339).is_ok()
+                    || OffsetDateTime::parse(&utc, &Rfc3339).is_ok()
+            }
+            Self::Base64Binary => {
+                let compact: String = value.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+                base64::engine::general_purpose::STANDARD
+                    .decode(compact)
+                    .is_ok()
+            }
+            Self::Duration => valid_xml_duration(lexical),
+            Self::AnyUri => !value.chars().any(char::is_control),
+        }
+    }
+}
+
+fn valid_xml_duration(value: &str) -> bool {
+    let value = value.strip_prefix('-').unwrap_or(value);
+    let Some(value) = value.strip_prefix('P') else {
+        return false;
+    };
+    let (date, time) = value
+        .split_once('T')
+        .map_or((value, None), |(date, time)| (date, Some(time)));
+    let components = |part: &str, units: &str| {
+        let mut previous = None;
+        let mut number = String::new();
+        for ch in part.chars() {
+            if ch.is_ascii_digit() || ch == '.' {
+                number.push(ch);
+                continue;
+            }
+            let Some(position) = units.find(ch) else {
+                return false;
+            };
+            if previous.is_some_and(|p| p >= position)
+                || !number.bytes().any(|b| b.is_ascii_digit())
+                || number.starts_with('.')
+                || number.ends_with('.')
+                || number.bytes().filter(|b| *b == b'.').count() > usize::from(ch == 'S')
+            {
+                return false;
+            }
+            previous = Some(position);
+            number.clear();
+        }
+        number.is_empty()
+    };
+    !value.is_empty()
+        && components(date, "YMD")
+        && time.is_none_or(|part| !part.is_empty() && components(part, "HMS"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[allow(clippy::large_enum_variant)] // correlation fields mirror the export schema and edit form
 pub enum RuleFilter {
     Sql {
         expression: String,
@@ -363,12 +527,51 @@ pub enum RuleFilter {
         reply_to_session_id: Option<String>,
         content_type: Option<String>,
         properties: Vec<(String, String)>,
+        /// Missing entries represent strings, preserving earlier JSON exports.
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        property_types: std::collections::BTreeMap<String, CorrelationPropertyType>,
     },
     True,
     False,
 }
 
 impl RuleFilter {
+    /// Refuse ambiguous or unsupported typed correlation values before a
+    /// destructive replacement or namespace import begins.
+    pub fn validate(&self) -> Result<(), String> {
+        let Self::Correlation {
+            properties,
+            property_types,
+            ..
+        } = self
+        else {
+            return Ok(());
+        };
+        let mut names = std::collections::BTreeSet::new();
+        for (name, value) in properties {
+            if name.is_empty() || !names.insert(name.as_str()) {
+                return Err(format!(
+                    "correlation property '{name}' has an empty or duplicate name"
+                ));
+            }
+            let kind = property_types.get(name).copied().unwrap_or_default();
+            if !kind.accepts(value) {
+                return Err(format!(
+                    "correlation property '{name}' has an invalid or unsupported {} value",
+                    kind.as_str()
+                ));
+            }
+        }
+        for name in property_types.keys() {
+            if !names.contains(name.as_str()) {
+                return Err(format!(
+                    "correlation property type metadata references missing property '{name}'"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn summary(&self) -> String {
         match self {
@@ -455,5 +658,30 @@ mod tests {
         assert!(parse_iso8601("P1Y").is_none());
         assert!(parse_iso8601("P1M").is_none()); // month in date part
         assert!(parse_iso8601("PT1M").is_some()); // minute in time part
+    }
+
+    #[test]
+    fn typed_correlation_values_validate_without_numeric_loss() {
+        use CorrelationPropertyType as Kind;
+        assert!(Kind::Decimal.accepts("12345678901234567890.123456789"));
+        assert!(Kind::Boolean.accepts("0"));
+        assert!(Kind::DateTime.accepts("2026-10-02T12:34:56"));
+        assert!(Kind::Duration.accepts("-P1Y2M3DT4H5M6.123S"));
+        for (kind, value) in [
+            (Kind::Boolean, "yes"),
+            (Kind::Byte, "128"),
+            (Kind::Int, "2147483648"),
+            (Kind::UnsignedLong, "-1"),
+            (Kind::Decimal, "1e2"),
+            (Kind::Double, "infinity"),
+            (Kind::DateTime, "yesterday"),
+            (Kind::Base64Binary, "%%%=="),
+            (Kind::Duration, "P"),
+            (Kind::Duration, "P1M2Y"),
+            (Kind::Duration, "PT1.5H"),
+            (Kind::Duration, "PT"),
+        ] {
+            assert!(!kind.accepts(value), "{}: {value}", kind.as_str());
+        }
     }
 }

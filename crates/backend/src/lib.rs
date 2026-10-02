@@ -9,6 +9,8 @@
 pub mod backend;
 pub mod bridge;
 #[cfg(not(target_arch = "wasm32"))]
+mod rule_edit;
+#[cfg(not(target_arch = "wasm32"))]
 mod sb_runtime;
 
 #[cfg(not(target_arch = "wasm32"))]

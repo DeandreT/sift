@@ -1,6 +1,4 @@
-//! Read-only entity detail rendering with count chips, a status editor, and
-//! refresh/delete actions. Full property editing arrives with the create/edit
-//! form work later in Phase 1.
+//! Entity details, property editing, status changes, and refresh/delete actions.
 
 use std::time::Duration;
 
@@ -196,6 +194,12 @@ fn header(
         ui.heading(path.name());
         ui.label(egui::RichText::new(path.kind()).weak());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("Edit…").clicked() {
+                actions.push(AppAction::OpenEditDialog {
+                    ns,
+                    info: Box::new(info.clone()),
+                });
+            }
             if ui.button("Delete…").clicked() {
                 actions.push(AppAction::RequestDelete(ScopedEntity::new(
                     ns,

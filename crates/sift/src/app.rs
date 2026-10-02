@@ -10,9 +10,9 @@ use egui_dock::{DockArea, DockState};
 use egui_toast::{Toast, ToastKind, ToastOptions, Toasts};
 use sift_backend::{
     BackendHandle, Command, Disposition, EntityDescription, EntityInfo, EntityPath, Event,
-    MutationOp, NamespaceId,
+    MessageSource, MutationOp, NamespaceId,
 };
-use sift_core::config::{AppConfig, NamespaceProfile, ThemePreference};
+use sift_core::config::{AppConfig, AuthMethod, NamespaceProfile, ThemePreference};
 use sift_core::connection::NamespaceConnection;
 use sift_core::secrets::{SecretKind, SecretRef, SecretStore, SecretString};
 
@@ -26,6 +26,8 @@ use crate::ui::connect_dialog::{ConnectDialog, DialogAction};
 use crate::ui::dialogs::{
     ConfirmAction, ConfirmDialog, CreateAction, CreateDialog, PendingConfirm,
 };
+use crate::ui::edit_dialog;
+use crate::ui::edit_dialog::{EditAction, EditDialog};
 use crate::ui::send_dialog::{SendAction, SendDialog};
 use crate::ui::tabs::{self, TabId, TabViewerCtx};
 use crate::ui::{connect_dialog, dialogs, log_panel, send_dialog, tree_panel};
@@ -52,6 +54,7 @@ pub struct SiftApp {
     connect_dialog: Option<ConnectDialog>,
     confirm: Option<ConfirmDialog>,
     create_dialog: Option<CreateDialog>,
+    edit_dialog: Option<EditDialog>,
     send_dialog: Option<SendDialog>,
     running_ops: Vec<RunningOp>,
     about_open: bool,
@@ -95,6 +98,7 @@ impl SiftApp {
             connect_dialog: None,
             confirm: None,
             create_dialog: None,
+            edit_dialog: None,
             send_dialog: None,
             running_ops: Vec::new(),
             about_open: false,
@@ -116,6 +120,10 @@ impl SiftApp {
             .cloned()
             .collect();
         for profile in profiles {
+            if matches!(profile.auth, AuthMethod::AzureAd { .. }) {
+                self.start_connect(profile, SecretString::default());
+                continue;
+            }
             match self
                 .secrets
                 .get(&SecretRef::new(profile.id, SecretKind::ConnectionString))
@@ -183,6 +191,14 @@ impl SiftApp {
                     Err(e) => {
                         if let Some(detail) = &e.detail {
                             tracing::debug!("connect failure detail: {detail}");
+                        }
+                        if let Some(profile) = self.config.profile(ns)
+                            && matches!(profile.auth, AuthMethod::AzureAd { .. })
+                            && self.connect_dialog.is_none()
+                        {
+                            let mut dialog = ConnectDialog::from_profile(profile);
+                            dialog.error = Some(e.message.clone());
+                            self.connect_dialog = Some(dialog);
                         }
                         self.toast(ToastKind::Error, e.message);
                         // Drop the connecting placeholder; keep any other connection.
@@ -253,12 +269,21 @@ impl SiftApp {
                 self.tab_state(&ScopedEntity::new(ns, path)).info = info;
             }
             Event::Mutated {
+                req,
                 ns,
                 op,
                 path,
                 result,
-                ..
-            } => self.apply_mutation_event(ns, op, path, result),
+            } => {
+                if self
+                    .edit_dialog
+                    .as_mut()
+                    .is_some_and(|dialog| dialog.complete(req, &result))
+                {
+                    self.edit_dialog = None;
+                }
+                self.apply_mutation_event(ns, op, path, result);
+            }
             Event::Messages {
                 ns,
                 source,
@@ -271,6 +296,7 @@ impl SiftApp {
                 view.loading = false;
                 match result {
                     Ok(mut messages) => {
+                        view.invalidate_body_cache();
                         view.error = None;
                         if from_seq.is_some() {
                             view.rows.append(&mut messages);
@@ -357,19 +383,47 @@ impl SiftApp {
                 Err(e) => self.toast(ToastKind::Error, e.message),
             },
             Event::Session {
-                ns, source, result, ..
+                req,
+                ns,
+                source,
+                result,
             } => {
                 let scoped = ScopedEntity::new(ns, source.entity.clone());
-                let view = &mut self.tab_state(&scoped).sessions;
-                view.loading = false;
-                match result {
-                    Ok(snapshot) => {
-                        view.error = None;
-                        view.snapshot = Some(snapshot);
-                    }
-                    Err(e) => view.error = Some(e.message),
+                let release = match self.open_entities.get_mut(&scoped) {
+                    Some(tab) => tab.sessions.finish(req, result),
+                    None => result.ok().map(|snapshot| snapshot.lease_id),
+                };
+                if let Some(lease_id) = release {
+                    self.backend.send(Command::ReleaseSession {
+                        ns,
+                        source,
+                        lease_id,
+                    });
                 }
             }
+            Event::SessionSettled {
+                req,
+                ns,
+                source,
+                lease_id,
+                lock_token,
+                disposition,
+                result,
+            } => {
+                let scoped = ScopedEntity::new(ns, source.entity.clone());
+                let Some(tab) = self.open_entities.get_mut(&scoped) else {
+                    return;
+                };
+                let view = &mut tab.sessions;
+                if view.finish_settlement(req, lease_id, &lock_token, &disposition, result) {
+                    self.toast(
+                        ToastKind::Success,
+                        format!("{} the session message", disposition.verb()),
+                    );
+                    self.run_action(AppAction::RefreshEntity(scoped));
+                }
+            }
+
             Event::OpProgress {
                 op,
                 ns,
@@ -430,6 +484,13 @@ impl SiftApp {
 
     /// Forget a connection and everything scoped to it.
     fn remove_connection(&mut self, ns: NamespaceId) {
+        if self
+            .edit_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.ns == ns)
+        {
+            self.edit_dialog = None;
+        }
         self.connections.retain(|c| c.profile_id != ns);
         self.pending_connect.retain(|p| p.profile_id != ns);
         self.open_entities.retain(|scoped, _| scoped.ns != ns);
@@ -469,7 +530,15 @@ impl SiftApp {
                 let scoped = ScopedEntity::new(ns, path.clone());
                 match op {
                     MutationOp::Deleted => {
+                        self.run_action(AppAction::ReleaseSession {
+                            ns,
+                            source: MessageSource {
+                                entity: path.clone(),
+                                dead_letter: false,
+                            },
+                        });
                         self.open_entities.remove(&scoped);
+                        self.popped_out.retain(|entity| entity != &scoped);
                         if let Some(location) = self.dock.find_tab(&TabId::Entity(scoped)) {
                             self.dock.remove_tab(location);
                         }
@@ -546,9 +615,7 @@ impl SiftApp {
                         self.config
                             .profiles
                             .first()
-                            .map(|p| {
-                                ConnectDialog::for_profile(p.id, p.name.clone(), p.auto_connect)
-                            })
+                            .map(ConnectDialog::from_profile)
                             .unwrap_or_default(),
                     );
                 }
@@ -638,6 +705,15 @@ impl SiftApp {
                 let desc = description_of(&info);
                 let req = self.backend.next_request();
                 self.backend.send(Command::UpdateEntity { req, ns, desc });
+            }
+            AppAction::OpenEditDialog { ns, info } => {
+                if self.is_connected(ns) {
+                    let sku = self
+                        .connection(ns)
+                        .and_then(|c| c.info.as_ref())
+                        .and_then(|i| i.messaging_sku.as_deref());
+                    self.edit_dialog = Some(EditDialog::new(ns, &info, sku));
+                }
             }
             AppAction::OpenCreateDialog { ns, kind } => {
                 self.create_dialog = Some(CreateDialog::new(ns, kind));
@@ -732,12 +808,12 @@ impl SiftApp {
                 count,
             } => {
                 let scoped = ScopedEntity::new(ns, source.entity.clone());
+                let req = self.backend.next_request();
                 {
                     let view = &mut self.tab_state(&scoped).sessions;
-                    view.loading = true;
-                    view.error = None;
+                    view.release();
+                    view.begin(req, None);
                 }
-                let req = self.backend.next_request();
                 self.backend.send(Command::BrowseSession {
                     req,
                     ns,
@@ -745,6 +821,77 @@ impl SiftApp {
                     session_id,
                     count,
                 });
+            }
+            AppAction::ReceiveSession {
+                ns,
+                source,
+                lease_id,
+                count,
+                sequence_numbers,
+            } => {
+                let scoped = ScopedEntity::new(ns, source.entity.clone());
+                let req = self.backend.next_request();
+                self.tab_state(&scoped).sessions.begin(req, None);
+                self.backend.send(Command::ReceiveSession {
+                    req,
+                    ns,
+                    source,
+                    lease_id,
+                    count,
+                    sequence_numbers,
+                });
+            }
+            AppAction::RenewSession {
+                ns,
+                source,
+                lease_id,
+                lock_token,
+            } => {
+                let scoped = ScopedEntity::new(ns, source.entity.clone());
+                let req = self.backend.next_request();
+                self.tab_state(&scoped)
+                    .sessions
+                    .begin(req, lock_token.clone());
+                self.backend.send(Command::RenewSession {
+                    req,
+                    ns,
+                    source,
+                    lease_id,
+                    lock_token,
+                });
+            }
+            AppAction::SettleSessionMessage {
+                ns,
+                source,
+                lease_id,
+                lock_token,
+                disposition,
+            } => {
+                let scoped = ScopedEntity::new(ns, source.entity.clone());
+                let req = self.backend.next_request();
+                self.tab_state(&scoped)
+                    .sessions
+                    .begin(req, Some(lock_token.clone()));
+                self.backend.send(Command::SettleSessionMessage {
+                    req,
+                    ns,
+                    source,
+                    lease_id,
+                    lock_token,
+                    disposition,
+                });
+            }
+            AppAction::ReleaseSession { ns, source } => {
+                let scoped = ScopedEntity::new(ns, source.entity.clone());
+                if let Some(tab) = self.open_entities.get_mut(&scoped)
+                    && let Some(lease_id) = tab.sessions.release()
+                {
+                    self.backend.send(Command::ReleaseSession {
+                        ns,
+                        source,
+                        lease_id,
+                    });
+                }
             }
             AppAction::PeekMessages {
                 ns,
@@ -864,6 +1011,13 @@ impl SiftApp {
                     self.start_connect(profile, secret);
                 }
             }
+            DialogAction::SignIn => {
+                if let Some((profile, secret)) = self.save_profile() {
+                    self.connect_dialog = None;
+                    self.start_connect_with_sign_in(profile, secret, true);
+                    self.toast(ToastKind::Info, "Finish signing in in your browser.");
+                }
+            }
             DialogAction::Delete(id) => {
                 self.config.remove_profile(id);
                 if let Err(e) = self
@@ -882,8 +1036,50 @@ impl SiftApp {
 
     /// Validate the dialog input, persist the profile + secret, and return
     /// them. On failure the error is shown inside the dialog.
+    #[allow(clippy::too_many_lines)] // Both auth paths validate and persist one profile.
     fn save_profile(&mut self) -> Option<(NamespaceProfile, SecretString)> {
         let dialog = self.connect_dialog.as_mut()?;
+        if dialog.entra {
+            let endpoint = match sift_core::connection::namespace_endpoint(&dialog.namespace) {
+                Ok(endpoint) => endpoint,
+                Err(error) => {
+                    dialog.error = Some(error);
+                    return None;
+                }
+            };
+            let tenant_id =
+                (!dialog.tenant_id.trim().is_empty()).then(|| dialog.tenant_id.trim().to_owned());
+            if let Err(error) = sift_mgmt::auth::validate_tenant(tenant_id.as_deref()) {
+                dialog.error = Some(error);
+                return None;
+            }
+            let mut profile = dialog
+                .selected
+                .and_then(|id| self.config.profile(id).cloned())
+                .unwrap_or_else(|| NamespaceProfile::new_connection_string(String::new()));
+            profile.name = if dialog.name.trim().is_empty() {
+                endpoint
+                    .host_str()
+                    .unwrap_or_default()
+                    .split('.')
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned()
+            } else {
+                dialog.name.trim().to_owned()
+            };
+            profile.endpoint = Some(endpoint);
+            profile.transport = dialog.transport;
+            profile.auto_connect = dialog.auto_connect;
+            profile.auth = AuthMethod::AzureAd { tenant_id };
+            dialog.selected = Some(profile.id);
+            profile.name.clone_into(&mut dialog.name);
+            dialog.connection_string.clear();
+            dialog.error = None;
+            self.config.upsert_profile(profile.clone());
+            self.persist_config();
+            return Some((profile, SecretString::default()));
+        }
         let typed = dialog.connection_string.trim();
 
         let (secret, newly_typed) = if typed.is_empty() {
@@ -932,6 +1128,7 @@ impl SiftApp {
         profile.endpoint = Some(conn.endpoint.clone());
         profile.transport = conn.transport;
         profile.auto_connect = dialog.auto_connect;
+        profile.auth = AuthMethod::ConnectionString;
 
         if newly_typed
             && let Err(e) = self.secrets.set(
@@ -953,6 +1150,15 @@ impl SiftApp {
     }
 
     fn start_connect(&mut self, profile: NamespaceProfile, secret: SecretString) {
+        self.start_connect_with_sign_in(profile, secret, false);
+    }
+
+    fn start_connect_with_sign_in(
+        &mut self,
+        profile: NamespaceProfile,
+        secret: SecretString,
+        sign_in: bool,
+    ) {
         let req = self.backend.next_request();
         // Replace any earlier attempt for this profile.
         self.pending_connect.retain(|p| p.profile_id != profile.id);
@@ -971,10 +1177,14 @@ impl SiftApp {
                 .push(Connection::connecting(profile.id, profile.name.clone()));
         }
         tracing::info!("connecting to {}…", profile.name);
-        self.backend.send(Command::Connect {
-            req,
-            profile,
-            secret,
+        self.backend.send(if sign_in {
+            Command::SignIn { req, profile }
+        } else {
+            Command::Connect {
+                req,
+                profile,
+                secret,
+            }
         });
     }
 
@@ -1347,6 +1557,25 @@ impl SiftApp {
             }
         }
 
+        if let Some(mut dialog) = self.edit_dialog.take() {
+            match edit_dialog::show(ctx, &mut dialog) {
+                Some(EditAction::Save) => {
+                    if let Some(desc) = dialog.build() {
+                        let req = self.backend.next_request();
+                        dialog.saving = Some(req);
+                        self.backend.send(Command::UpdateEntity {
+                            req,
+                            ns: dialog.ns,
+                            desc,
+                        });
+                    }
+                    self.edit_dialog = Some(dialog);
+                }
+                Some(EditAction::Close) => {}
+                None => self.edit_dialog = Some(dialog),
+            }
+        }
+
         if let Some(mut dialog) = self.send_dialog.take() {
             match send_dialog::show(ctx, &mut dialog) {
                 Some(SendAction::Send) => {
@@ -1401,7 +1630,15 @@ impl SiftApp {
                 tabs::render_entity(ui, connected, entities, peek_batch, &scoped, true, actions);
                 ui.input(|i| i.viewport().close_requested())
             });
-            if !closed {
+            if closed {
+                actions.push(AppAction::ReleaseSession {
+                    ns: scoped.ns,
+                    source: MessageSource {
+                        entity: scoped.path,
+                        dead_letter: false,
+                    },
+                });
+            } else {
                 still_open.push(scoped);
             }
         }
@@ -1436,6 +1673,24 @@ fn load_result<T>(
             });
             Loadable::Failed(e.message)
         }
+    }
+}
+
+impl Drop for SiftApp {
+    fn drop(&mut self) {
+        self.backend.send(Command::Shutdown);
+        // The window is already closing. Give receiver detach/lock release
+        // time to finish before the process exits, with a bounded wait if a
+        // broker operation is unresponsive.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+            match self.evt_rx.recv_timeout(remaining) {
+                Ok(_) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => break,
+            }
+        }
+        tracing::warn!("backend cleanup did not finish before the shutdown deadline");
     }
 }
 

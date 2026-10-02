@@ -1,10 +1,12 @@
 pub mod connect_dialog;
 pub mod dashboard;
 pub mod dialogs;
+pub mod edit_dialog;
 pub mod entity_view;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod log_panel;
 pub mod messages_view;
+pub(crate) mod payload_text;
 pub mod send_dialog;
 pub mod sessions_view;
 pub mod tabs;

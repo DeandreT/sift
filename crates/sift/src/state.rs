@@ -217,7 +217,7 @@ pub enum EntityPage {
     Sessions,
 }
 
-/// Read-only session browser state for one entity.
+/// Held session and pending request state for one entity.
 #[derive(Debug, Default)]
 pub struct SessionsView {
     /// Optional session id to accept; empty accepts the next available.
@@ -225,7 +225,13 @@ pub struct SessionsView {
     pub loading: bool,
     pub error: Option<String>,
     pub snapshot: Option<sift_backend::SessionSnapshot>,
-    /// Messages peeked per browse.
+    /// Responses must match this request before they can change the view.
+    pub pending_request: Option<RequestId>,
+    pub pending_message: Option<String>,
+    pub deferred: Vec<i64>,
+    pub dead_letter_reason: String,
+    pub dead_letter_description: String,
+    /// Messages fetched per operation.
     pub fetch_count: u32,
 }
 
@@ -237,12 +243,136 @@ impl SessionsView {
             ..Self::default()
         }
     }
+
+    pub fn begin(&mut self, req: RequestId, token: Option<String>) {
+        self.loading = true;
+        self.error = None;
+        self.pending_request = Some(req);
+        self.pending_message = token;
+    }
+
+    /// Invalidate late responses while keeping the view's input preferences.
+    pub fn release(&mut self) -> Option<Uuid> {
+        self.loading = false;
+        self.pending_request = None;
+        self.pending_message = None;
+        self.deferred.clear();
+        self.snapshot.take().map(|snapshot| snapshot.lease_id)
+    }
+
+    pub fn finish(
+        &mut self,
+        req: RequestId,
+        result: Result<sift_backend::SessionSnapshot, sift_backend::BackendError>,
+    ) -> Option<Uuid> {
+        if self.pending_request != Some(req) {
+            return result
+                .ok()
+                .map(|snapshot| snapshot.lease_id)
+                .filter(|lease_id| {
+                    self.snapshot
+                        .as_ref()
+                        .is_none_or(|snapshot| snapshot.lease_id != *lease_id)
+                });
+        }
+        self.loading = false;
+        self.pending_request = None;
+        match result {
+            Ok(snapshot) => {
+                self.deferred.retain(|sequence| {
+                    !snapshot
+                        .messages
+                        .iter()
+                        .any(|row| row.sequence_number == *sequence && row.lock_token.is_some())
+                });
+                self.snapshot = Some(snapshot);
+                self.error = None;
+            }
+            Err(error) => {
+                if error.session_lock_lost() {
+                    self.release();
+                } else if error.lock_lost()
+                    && let (Some(snapshot), Some(token)) =
+                        (&mut self.snapshot, &self.pending_message)
+                {
+                    for row in &mut snapshot.messages {
+                        if row.lock_token.as_ref() == Some(token) {
+                            row.lock_token = None;
+                        }
+                    }
+                }
+                self.error = Some(error.message);
+            }
+        }
+        self.pending_message = None;
+        None
+    }
+
+    /// Apply a settlement only to the receiver/request that issued it.
+    /// Returns true when the entity counts should be refreshed.
+    pub fn finish_settlement(
+        &mut self,
+        req: RequestId,
+        lease_id: Uuid,
+        token: &str,
+        disposition: &Disposition,
+        result: Result<(), sift_backend::BackendError>,
+    ) -> bool {
+        if self.pending_request != Some(req)
+            || self
+                .snapshot
+                .as_ref()
+                .is_none_or(|snapshot| snapshot.lease_id != lease_id)
+        {
+            return false;
+        }
+        self.loading = false;
+        self.pending_request = None;
+        self.pending_message = None;
+        match result {
+            Ok(()) => {
+                if let Some(snapshot) = &mut self.snapshot {
+                    if *disposition == Disposition::Defer
+                        && let Some(row) = snapshot
+                            .messages
+                            .iter()
+                            .find(|row| row.lock_token.as_deref() == Some(token))
+                        && !self.deferred.contains(&row.sequence_number)
+                    {
+                        self.deferred.push(row.sequence_number);
+                    }
+                    snapshot
+                        .messages
+                        .retain(|row| row.lock_token.as_deref() != Some(token));
+                }
+                self.error = None;
+                true
+            }
+            Err(error) => {
+                if error.session_lock_lost() {
+                    self.release();
+                } else if error.lock_lost()
+                    && let Some(snapshot) = &mut self.snapshot
+                {
+                    for row in &mut snapshot.messages {
+                        if row.lock_token.as_deref() == Some(token) {
+                            row.lock_token = None;
+                        }
+                    }
+                }
+                self.error = Some(error.message);
+                false
+            }
+        }
+    }
 }
 
 /// UI state for one message browsing surface (main queue or DLQ).
 #[derive(Debug)]
 pub struct MessagesView {
     pub rows: Vec<SiftMessage>,
+    /// Changes whenever a payload is replaced, even if its allocation is reused.
+    pub body_generation: Uuid,
     pub selected: Option<usize>,
     pub loading: bool,
     pub error: Option<String>,
@@ -262,6 +392,7 @@ impl MessagesView {
     pub fn new(fetch_count: u32) -> Self {
         Self {
             rows: Vec::new(),
+            body_generation: Uuid::new_v4(),
             selected: None,
             loading: false,
             error: None,
@@ -270,6 +401,11 @@ impl MessagesView {
             show_base64: false,
             deferred_seqs: Vec::new(),
         }
+    }
+
+    /// Invalidate preview state without scanning or hashing the full payload.
+    pub fn invalidate_body_cache(&mut self) {
+        self.body_generation = Uuid::new_v4();
     }
 
     /// Sequence number to continue peeking from.
@@ -365,6 +501,10 @@ pub enum AppAction {
         ns: NamespaceId,
         info: Box<EntityInfo>,
     },
+    OpenEditDialog {
+        ns: NamespaceId,
+        info: Box<EntityInfo>,
+    },
     OpenCreateDialog {
         ns: NamespaceId,
         kind: CreateKind,
@@ -429,12 +569,36 @@ pub enum AppAction {
         ns: NamespaceId,
         overwrite: bool,
     },
-    /// Accept and browse a session (read-only).
+    /// Accept and retain a session receiver.
     BrowseSession {
         ns: NamespaceId,
         source: MessageSource,
         session_id: Option<String>,
         count: u32,
+    },
+    ReceiveSession {
+        ns: NamespaceId,
+        source: MessageSource,
+        lease_id: Uuid,
+        count: u32,
+        sequence_numbers: Vec<i64>,
+    },
+    RenewSession {
+        ns: NamespaceId,
+        source: MessageSource,
+        lease_id: Uuid,
+        lock_token: Option<String>,
+    },
+    SettleSessionMessage {
+        ns: NamespaceId,
+        source: MessageSource,
+        lease_id: Uuid,
+        lock_token: String,
+        disposition: Disposition,
+    },
+    ReleaseSession {
+        ns: NamespaceId,
+        source: MessageSource,
     },
     /// Save the selected message's exact body bytes to a local file.
     SaveMessageBody(Box<SiftMessage>),
@@ -495,4 +659,152 @@ pub struct DashboardState {
     /// Namespaces whose subscriptions should be fanned out once their topic
     /// list arrives (set by a dashboard refresh).
     pub wants_subscriptions: HashSet<Uuid>,
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use sift_backend::{BackendError, SessionSnapshot};
+    use sift_core::body::decode;
+    use sift_core::message::MessageState;
+
+    fn snapshot() -> SessionSnapshot {
+        let until = time::OffsetDateTime::now_utc() + time::Duration::minutes(1);
+        SessionSnapshot {
+            lease_id: Uuid::new_v4(),
+            session_id: "orders".into(),
+            locked_until: until,
+            state: None,
+            messages: vec![SiftMessage {
+                sequence_number: 42,
+                message_id: None,
+                subject: None,
+                content_type: None,
+                correlation_id: None,
+                session_id: Some("orders".into()),
+                reply_to: None,
+                to: None,
+                enqueued_time: None,
+                expires_at: None,
+                time_to_live: None,
+                delivery_count: None,
+                state: MessageState::Active,
+                lock_token: Some("delivery".into()),
+                locked_until: Some(until),
+                dead_letter_reason: None,
+                dead_letter_error_description: None,
+                dead_letter_source: None,
+                application_properties: Vec::new(),
+                body: decode(b"payload".to_vec()),
+            }],
+        }
+    }
+
+    #[test]
+    fn late_accept_after_view_close_releases_its_receiver() {
+        let mut view = SessionsView::new(10);
+        view.begin(RequestId(1), None);
+        assert_eq!(view.release(), None);
+        let late = snapshot();
+        let lease_id = late.lease_id;
+        assert_eq!(view.finish(RequestId(1), Ok(late)), Some(lease_id));
+        assert!(view.snapshot.is_none());
+        assert!(!view.loading);
+    }
+
+    #[test]
+    fn stale_snapshot_does_not_release_current_receiver() {
+        let mut view = SessionsView::new(10);
+        let current = snapshot();
+        view.snapshot = Some(current.clone());
+        view.begin(RequestId(2), None);
+        assert_eq!(view.finish(RequestId(1), Ok(current.clone())), None);
+        assert_eq!(view.pending_request, Some(RequestId(2)));
+        let old = snapshot();
+        let old_id = old.lease_id;
+        assert_eq!(view.finish(RequestId(1), Ok(old)), Some(old_id));
+        assert_eq!(
+            view.snapshot.as_ref().expect("current retained").lease_id,
+            current.lease_id
+        );
+    }
+
+    #[test]
+    fn defer_tracks_sequence_and_removes_settled_delivery() {
+        let mut view = SessionsView::new(10);
+        let current = snapshot();
+        let lease_id = current.lease_id;
+        view.snapshot = Some(current);
+        view.begin(RequestId(1), Some("delivery".into()));
+        assert!(view.finish_settlement(
+            RequestId(1),
+            lease_id,
+            "delivery",
+            &Disposition::Defer,
+            Ok(())
+        ));
+        assert_eq!(view.deferred, vec![42]);
+        assert!(
+            view.snapshot
+                .as_ref()
+                .expect("receiver retained")
+                .messages
+                .is_empty()
+        );
+        assert!(!view.finish_settlement(
+            RequestId(1),
+            lease_id,
+            "delivery",
+            &Disposition::Defer,
+            Ok(())
+        ));
+        assert_eq!(view.deferred, vec![42]);
+    }
+
+    #[test]
+    fn retryable_settlement_failure_keeps_delivery_but_lock_loss_clears_it() {
+        let mut view = SessionsView::new(10);
+        let current = snapshot();
+        let lease_id = current.lease_id;
+        view.snapshot = Some(current);
+        view.begin(RequestId(1), Some("delivery".into()));
+        assert!(!view.finish_settlement(
+            RequestId(1),
+            lease_id,
+            "delivery",
+            &Disposition::Complete,
+            Err(BackendError::new("temporary network failure"))
+        ));
+        assert_eq!(
+            view.snapshot.as_ref().expect("retained").messages[0]
+                .lock_token
+                .as_deref(),
+            Some("delivery")
+        );
+        view.begin(RequestId(2), Some("delivery".into()));
+        assert!(!view.finish_settlement(
+            RequestId(2),
+            lease_id,
+            "delivery",
+            &Disposition::Complete,
+            Err(BackendError::new("com.microsoft:message-lock-lost"))
+        ));
+        assert!(
+            view.snapshot.as_ref().expect("session retained").messages[0]
+                .lock_token
+                .is_none()
+        );
+        view.begin(RequestId(3), None);
+        view.finish(
+            RequestId(3),
+            Err(BackendError::new("com.microsoft:session-lock-lost")),
+        );
+        assert!(view.snapshot.is_none());
+        assert!(
+            view.error
+                .as_deref()
+                .expect("visible failure")
+                .contains("session-lock-lost")
+        );
+    }
 }

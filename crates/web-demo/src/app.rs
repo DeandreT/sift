@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use egui_dock::{DockArea, DockState};
 use sift_backend::{
-    Disposition, EntityInfo, EntityPath, MessageSource, NamespaceId, ReceiveMode, SessionSnapshot,
+    Disposition, EntityDescription, EntityInfo, EntityPath, MessageSource, NamespaceId,
+    ReceiveMode, SessionSnapshot,
 };
 use sift_core::body::{DecodedBody, decode};
 use sift_core::message::{MessageState, SiftMessage};
@@ -16,6 +17,7 @@ use sift_ui::state::{
     AppAction, Connection, DashboardState, EntityPage, EntityTabState, EntityTree, Loadable,
     ScopedEntity, TreeFilter,
 };
+use sift_ui::ui::edit_dialog::{self, EditAction, EditDialog};
 use sift_ui::ui::{tabs::TabId, tabs::TabViewerCtx, tree_panel};
 use time::{OffsetDateTime, macros::datetime};
 use uuid::Uuid;
@@ -39,6 +41,7 @@ pub struct DemoApp {
     last_emit_at: f64,
     frame_time: f64,
     notice: Option<(String, f64)>,
+    edit_dialog: Option<EditDialog>,
 }
 
 impl DemoApp {
@@ -250,6 +253,7 @@ impl DemoApp {
             last_emit_at: 0.0,
             frame_time: 0.0,
             notice: None,
+            edit_dialog: None,
         };
         app.sync_counts();
         app
@@ -312,6 +316,7 @@ impl DemoApp {
         self.sync_counts();
     }
 
+    #[allow(clippy::too_many_lines)] // dispatches the shared desktop actions to simulated operations
     fn run_action(&mut self, action: AppAction) {
         match action {
             AppAction::OpenEntity(scoped) | AppAction::DockEntity(scoped) => {
@@ -361,6 +366,39 @@ impl DemoApp {
                 count,
                 ..
             } => self.browse_session(source, session_id, count),
+            AppAction::ReceiveSession {
+                source,
+                lease_id,
+                count,
+                sequence_numbers,
+                ..
+            } => {
+                self.receive_session(&source, lease_id, count, &sequence_numbers);
+            }
+            AppAction::RenewSession {
+                source,
+                lease_id,
+                lock_token,
+                ..
+            } => {
+                self.renew_session(&source, lease_id, lock_token.as_deref());
+            }
+            AppAction::SettleSessionMessage {
+                source,
+                lease_id,
+                lock_token,
+                disposition,
+                ..
+            } => {
+                self.settle_session(&source, lease_id, &lock_token, disposition);
+            }
+            AppAction::ReleaseSession { source, .. } => {
+                let scoped = ScopedEntity::new(DEMO_NAMESPACE, source.entity);
+                if let Some(state) = self.entities.get_mut(&scoped) {
+                    state.sessions.release();
+                }
+                self.note("Released the simulated session");
+            }
             AppAction::OpenSendDialog {
                 target, prefill, ..
             } => self.send_sample(target, prefill.as_deref()),
@@ -368,6 +406,14 @@ impl DemoApp {
             AppAction::UpdateEntity { info, .. } => {
                 self.update_entity(*info);
                 self.note("Entity status updated in the simulation");
+            }
+            AppAction::OpenEditDialog { ns, info } => {
+                let sku = self
+                    .connections
+                    .first()
+                    .and_then(|c| c.info.as_ref())
+                    .and_then(|i| i.messaging_sku.as_deref());
+                self.edit_dialog = Some(EditDialog::new(ns, &info, sku));
             }
             AppAction::SetDashboardAutoRefresh(mode) => {
                 self.dashboard.auto_refresh = mode;
@@ -434,6 +480,7 @@ impl DemoApp {
         if from_seq.is_some() {
             view.rows.extend(rows);
         } else {
+            view.invalidate_body_cache();
             view.rows = rows;
             view.selected = None;
         }
@@ -467,6 +514,7 @@ impl DemoApp {
         }
 
         let view = self.message_view_mut(message_source);
+        view.invalidate_body_cache();
         view.rows = rows;
         view.selected = None;
         view.loading = false;
@@ -610,6 +658,7 @@ impl DemoApp {
             message.locked_until = Some(OffsetDateTime::now_utc() + time::Duration::minutes(1));
         }
         let view = self.message_view_mut(message_source);
+        view.invalidate_body_cache();
         view.rows = rows;
         view.selected = None;
         self.note("Retrieved deferred messages");
@@ -636,16 +685,149 @@ impl DemoApp {
             .entities
             .entry(scoped)
             .or_insert_with(|| EntityTabState::new(PEEK_BATCH));
-        state.sessions.loading = false;
+        state.sessions.release();
         state.sessions.error = None;
         state.sessions.snapshot = Some(SessionSnapshot {
+            lease_id: Uuid::new_v4(),
             session_id: wanted,
+            locked_until: OffsetDateTime::now_utc() + time::Duration::minutes(1),
             state: Some(DecodedBody::amqp_value(
                 "{ status: \"processing\", attempt: 2 }".to_owned(),
             )),
             messages,
         });
         self.note("Accepted the simulated session");
+    }
+
+    fn receive_session(
+        &mut self,
+        source: &MessageSource,
+        lease_id: Uuid,
+        count: u32,
+        sequences: &[i64],
+    ) {
+        let scoped = ScopedEntity::new(DEMO_NAMESPACE, source.entity.clone());
+        let Some(view) = self
+            .entities
+            .get_mut(&scoped)
+            .map(|state| &mut state.sessions)
+        else {
+            return;
+        };
+        let Some(snapshot) = &mut view.snapshot else {
+            return;
+        };
+        if snapshot.lease_id != lease_id || snapshot.lock_expired(OffsetDateTime::now_utc()) {
+            return;
+        }
+        let session_id = snapshot.session_id.clone();
+        let rows = self
+            .messages
+            .get(source)
+            .into_iter()
+            .flatten()
+            .filter(|message| {
+                message.session_id.as_deref() == Some(session_id.as_str())
+                    && (if sequences.is_empty() {
+                        message.state == MessageState::Active
+                    } else {
+                        sequences.contains(&message.sequence_number)
+                    })
+                    && !snapshot.messages.iter().any(|row| {
+                        row.sequence_number == message.sequence_number && row.lock_token.is_some()
+                    })
+            })
+            .take(count as usize)
+            .cloned()
+            .collect::<Vec<_>>();
+        for mut row in rows {
+            row.lock_token = Some(format!("demo-session-lock-{}", row.sequence_number));
+            row.locked_until = Some(snapshot.locked_until);
+            snapshot
+                .messages
+                .retain(|message| message.sequence_number != row.sequence_number);
+            snapshot.messages.push(row);
+        }
+        snapshot
+            .messages
+            .sort_by_key(|message| message.sequence_number);
+        view.loading = false;
+        self.note("Received session messages with simulated locks");
+    }
+
+    fn renew_session(&mut self, source: &MessageSource, lease_id: Uuid, token: Option<&str>) {
+        let scoped = ScopedEntity::new(DEMO_NAMESPACE, source.entity.clone());
+        let Some(view) = self
+            .entities
+            .get_mut(&scoped)
+            .map(|state| &mut state.sessions)
+        else {
+            return;
+        };
+        let Some(snapshot) = &mut view.snapshot else {
+            return;
+        };
+        if snapshot.lease_id != lease_id || snapshot.lock_expired(OffsetDateTime::now_utc()) {
+            return;
+        }
+        let until = OffsetDateTime::now_utc() + time::Duration::minutes(1);
+        if token.is_some_and(|token| {
+            !snapshot
+                .messages
+                .iter()
+                .any(|row| row.lock_token.as_deref() == Some(token))
+        }) {
+            return;
+        }
+        snapshot.locked_until = until;
+        for row in &mut snapshot.messages {
+            if row.lock_token.is_some() {
+                row.locked_until = Some(until);
+            }
+        }
+        self.note("Renewed the simulated lock");
+    }
+
+    fn settle_session(
+        &mut self,
+        source: &MessageSource,
+        lease_id: Uuid,
+        token: &str,
+        disposition: Disposition,
+    ) {
+        let scoped = ScopedEntity::new(DEMO_NAMESPACE, source.entity.clone());
+        let Some(view) = self
+            .entities
+            .get_mut(&scoped)
+            .map(|state| &mut state.sessions)
+        else {
+            return;
+        };
+        let Some(snapshot) = &mut view.snapshot else {
+            return;
+        };
+        if snapshot.lease_id != lease_id || snapshot.lock_expired(OffsetDateTime::now_utc()) {
+            return;
+        }
+        let Some(selected) = snapshot
+            .messages
+            .iter()
+            .find(|row| row.lock_token.as_deref() == Some(token))
+            .cloned()
+        else {
+            return;
+        };
+        if disposition == Disposition::Defer && !view.deferred.contains(&selected.sequence_number) {
+            view.deferred.push(selected.sequence_number);
+        }
+        // Reuse the message simulation's dispositions, then remove the
+        // settled delivery from the session workspace for every disposition.
+        snapshot
+            .messages
+            .retain(|row| row.lock_token.as_deref() != Some(token));
+        self.message_view_mut(source).rows.push(selected);
+        self.settle(source, token, disposition);
+        self.message_view_mut(source).remove_by_lock_token(token);
     }
 
     fn send_sample(
@@ -742,6 +924,51 @@ impl DemoApp {
         let scoped = ScopedEntity::new(DEMO_NAMESPACE, info.path());
         if let Some(state) = self.entities.get_mut(&scoped) {
             state.info = Loadable::Loaded(info);
+        }
+    }
+
+    fn show_edit_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.edit_dialog.take() else {
+            return;
+        };
+        match edit_dialog::show(ctx, &mut dialog) {
+            Some(EditAction::Save) => {
+                if let Some(description) = dialog.build() {
+                    if let Some(mut info) = self.lookup_info(&description.path()) {
+                        match (&mut info, description) {
+                            (EntityInfo::Queue(info), EntityDescription::Queue(p)) => {
+                                info.properties = p;
+                            }
+                            (EntityInfo::Topic(info), EntityDescription::Topic(p)) => {
+                                info.properties = p;
+                            }
+                            (
+                                EntityInfo::Subscription(info),
+                                EntityDescription::Subscription(p),
+                            ) => info.properties = p,
+                            (EntityInfo::Rule(info), EntityDescription::Rule(p)) => {
+                                info.properties = p;
+                            }
+                            _ => {
+                                dialog.error =
+                                    Some("Entity kind changed; refresh before editing.".into());
+                                self.edit_dialog = Some(dialog);
+                                return;
+                            }
+                        }
+                        self.update_entity(info);
+                        self.note("Entity properties updated in the simulation");
+                    } else {
+                        dialog.error =
+                            Some("The entity is unavailable; refresh before editing.".into());
+                        self.edit_dialog = Some(dialog);
+                    }
+                } else {
+                    self.edit_dialog = Some(dialog);
+                }
+            }
+            Some(EditAction::Close) => {}
+            None => self.edit_dialog = Some(dialog),
         }
     }
 
@@ -930,6 +1157,7 @@ impl eframe::App for DemoApp {
         for action in actions {
             self.run_action(action);
         }
+        self.show_edit_dialog(ui.ctx());
     }
 }
 

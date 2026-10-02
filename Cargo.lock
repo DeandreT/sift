@@ -525,6 +525,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "azure_identity"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fb64e97087965481c94f1703c57e678df09df73e2cdaee8952558f9c6c7d100"
+dependencies = [
+ "async-lock",
+ "async-trait",
+ "azure_core",
+ "futures",
+ "pin-project",
+ "serde",
+ "time",
+ "tracing",
+ "typespec_client_core",
+ "url",
+]
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4482,6 +4500,7 @@ name = "sift-backend"
 version = "0.1.0"
 dependencies = [
  "azservicebus",
+ "azure_core",
  "crossbeam-channel",
  "fe2o3-amqp-types",
  "serde",
@@ -4524,10 +4543,15 @@ dependencies = [
 name = "sift-mgmt"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "azure_core",
+ "azure_identity",
+ "base64",
  "quick-xml",
  "reqwest",
  "roxmltree",
  "serde",
+ "serde_json",
  "sift-core",
  "thiserror 2.0.19",
  "time",
@@ -5000,6 +5024,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

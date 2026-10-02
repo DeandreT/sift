@@ -4,6 +4,7 @@ use sift_backend::{EntityPath, NamespaceId};
 use sift_core::message::OutboundMessage;
 
 use crate::icons::{Icon, icon};
+use crate::ui::payload_text::{self, PagedEditor};
 
 #[derive(Debug)]
 pub struct SendDialog {
@@ -27,6 +28,7 @@ pub struct SendDialog {
     /// Minutes from now to schedule delivery; empty/0 sends immediately.
     pub schedule_in_minutes: String,
     pub error: Option<String>,
+    body_editor: Option<PagedEditor>,
 }
 
 impl SendDialog {
@@ -49,6 +51,7 @@ impl SendDialog {
             repeat: 1,
             schedule_in_minutes: String::new(),
             error: None,
+            body_editor: None,
         }
     }
 
@@ -88,6 +91,7 @@ impl SendDialog {
 
     /// Replace every editable message field from an imported template.
     pub fn load_message(&mut self, from: OutboundMessage) {
+        self.body_editor = None;
         self.body = from.body;
         self.raw_bytes = from.raw_bytes;
         self.message_id = from.message_id.unwrap_or_default();
@@ -109,19 +113,26 @@ impl SendDialog {
 
     /// Replace only the payload, retaining the other composed properties.
     pub fn load_payload(&mut self, bytes: Vec<u8>) {
-        let decoded = sift_core::body::decode(bytes.clone());
-        if !decoded.gzipped
-            && decoded.format != sift_core::body::BodyFormat::Binary
-            && let Ok(text) = std::str::from_utf8(&bytes)
-        {
-            text.clone_into(&mut self.body);
-            self.raw_bytes = None;
+        self.body_editor = None;
+        let format = if !bytes.starts_with(&[0x1f, 0x8b]) && std::str::from_utf8(&bytes).is_ok() {
+            let text = String::from_utf8(bytes).expect("validated UTF-8 payload");
+            let format = sift_core::body::text_format(&text);
+            if format == sift_core::body::BodyFormat::Binary {
+                self.body.clear();
+                self.raw_bytes = Some(text.into_bytes());
+            } else {
+                self.body = text;
+                self.raw_bytes = None;
+            }
+            format
         } else {
+            let decoded = sift_core::body::decode(bytes);
             self.body.clear();
-            self.raw_bytes = Some(bytes);
-        }
+            self.raw_bytes = Some(decoded.bytes);
+            decoded.format
+        };
         if self.content_type.trim().is_empty() {
-            match decoded.format {
+            match format {
                 sift_core::body::BodyFormat::Json => "application/json",
                 sift_core::body::BodyFormat::Xml => "application/xml",
                 sift_core::body::BodyFormat::Text => "text/plain",
@@ -222,9 +233,7 @@ pub fn show(ctx: &egui::Context, dialog: &mut SendDialog) -> Option<SendAction> 
 
         if dialog.raw_bytes.is_some() {
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Resending the original binary body unchanged.").weak(),
-                );
+                ui.label(egui::RichText::new("Resending the original body unchanged.").weak());
                 if ui.small_button("Discard and edit as text").clicked() {
                     dialog.raw_bytes = None;
                 }
@@ -237,13 +246,7 @@ pub fn show(ctx: &egui::Context, dialog: &mut SendDialog) -> Option<SendAction> 
                 .id_salt("send-body")
                 .max_height(max_body)
                 .show(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut dialog.body)
-                            .code_editor()
-                            .hint_text("message body")
-                            .desired_rows(8)
-                            .desired_width(f32::INFINITY),
-                    );
+                    let _ = payload_text::editor(ui, &mut dialog.body, &mut dialog.body_editor);
                 });
         }
         ui.add_space(8.0);
@@ -377,7 +380,7 @@ mod tests {
         let mut dialog = dialog();
         dialog.load_payload(bytes.clone());
 
-        assert!(dialog.body.is_empty());
+        assert_eq!(dialog.body, "");
         assert_eq!(dialog.raw_bytes.as_deref(), Some(bytes.as_slice()));
         assert_eq!(dialog.build_message().unwrap().payload(), bytes);
     }
@@ -397,5 +400,61 @@ mod tests {
         assert_eq!(message.message_id.as_deref(), Some("message-1"));
         assert_eq!(message.to.as_deref(), Some("orders"));
         assert_eq!(message.reply_to.as_deref(), Some("order-replies"));
+    }
+
+    #[test]
+    fn large_json_import_renders_bounded_pages_and_sends_and_exports_every_byte() {
+        use sift_core::body::MAX_INLINE_TEXT_BYTES;
+        use sift_core::message_file::MessageFile;
+        use std::time::Instant;
+
+        let original = format!("{{\"data\":\"{}\"}}", "x".repeat(1_400_000)).into_bytes();
+        let mut dialog = dialog();
+        let imported_at = Instant::now();
+        dialog.load_payload(original.clone());
+        let import_elapsed = imported_at.elapsed();
+        assert_eq!(dialog.content_type, "application/json");
+        let ctx = egui::Context::default();
+        crate::icons::install(&ctx);
+        let rendered_at = Instant::now();
+        for frame in 0..20 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 900.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                let _ = show(ui.ctx(), &mut dialog);
+            });
+            assert!(
+                dialog
+                    .body_editor
+                    .as_ref()
+                    .expect("large body is paged")
+                    .visible_bytes()
+                    <= MAX_INLINE_TEXT_BYTES
+            );
+            assert_eq!(
+                dialog.body.len(),
+                original.len(),
+                "frame {frame} must preserve the full body"
+            );
+        }
+        let render_elapsed = rendered_at.elapsed();
+        let message = dialog.build_message().expect("valid message");
+        assert_eq!(message.payload(), original);
+        let json = MessageFile::from_outbound(&message)
+            .to_json()
+            .expect("template JSON");
+        let restored = MessageFile::from_json(&json)
+            .expect("template parsed")
+            .to_outbound()
+            .expect("template message");
+        assert_eq!(restored.payload(), original);
+        eprintln!(
+            "1.4 MB JSON: import {import_elapsed:?}, 20 bounded composer frames {render_elapsed:?}"
+        );
     }
 }
