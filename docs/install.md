@@ -26,7 +26,7 @@ Download `sift-<version>-x86_64-pc-windows-msvc.zip` and its `.sha256` sidecar.
 In PowerShell, compare the following hash with the first value in the sidecar:
 
 ```powershell
-Get-FileHash .\sift-0.1.0-x86_64-pc-windows-msvc.zip -Algorithm SHA256
+Get-FileHash .\sift-0.1.1-x86_64-pc-windows-msvc.zip -Algorithm SHA256
 ```
 
 Extract the ZIP into a user-writable folder and open `sift.exe`. The portable
@@ -40,23 +40,27 @@ Download `sift-<version>-x86_64-unknown-linux-gnu.tar.gz` and its `.sha256`
 sidecar. In the download folder:
 
 ```sh
-sha256sum --check sift-0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
-tar -xzf sift-0.1.0-x86_64-unknown-linux-gnu.tar.gz
-cd sift-0.1.0-x86_64-unknown-linux-gnu
+sha256sum --check sift-0.1.1-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf sift-0.1.1-x86_64-unknown-linux-gnu.tar.gz
+cd sift-0.1.1-x86_64-unknown-linux-gnu
 ./sift
 ```
 
 Linux archives from the release workflow target an x86_64 desktop with glibc
 2.35 or newer. Locally built developer archives inherit the build machine's
-library requirements and may require a newer distribution. On Ubuntu 22.04 or
-24.04, install the runtime libraries if they are missing:
+library requirements and may require a newer distribution. On Ubuntu 22.04,
+install the runtime libraries if they are missing:
 
 ```sh
 sudo apt-get update
-sudo apt-get install -y libgtk-3-0 libxkbcommon0 libwayland-client0 \
-  libxcb-shape0 libxcb-xfixes0 libegl1 libgl1 libvulkan1 \
+sudo apt-get install -y libgtk-3-0 libxkbcommon0 libxkbcommon-x11-0 libwayland-client0 \
+  libxcb-shape0 libxcb-xfixes0 libegl1 libgl1 libvulkan1 libssl3 \
+  libbrotli1 libzstd1 zlib1g \
   dbus-user-session gnome-keyring
 ```
+
+On Ubuntu 24.04, use the same command with `libgtk-3-0t64` in place of
+`libgtk-3-0` and `libssl3t64` in place of `libssl3`.
 
 A desktop graphics driver and a user D-Bus session are required. Unlock the
 desktop keyring to persist SAS credentials across launches. If Secret Service

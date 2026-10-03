@@ -1,4 +1,4 @@
-# Sift 0.1.0 preview candidate
+# Sift 0.1.1 preview candidate
 
 This document describes the release candidate built from the accompanying
 source revision. Publication and platform/live-service validation are tracked
@@ -36,6 +36,10 @@ See [installation](install.md), [platform support](support.md), and
 artifacts are not part of this preview. Linux requires a compatible desktop
 graphics driver and runtime libraries. Credential persistence needs an
 available operating system credential store.
+
+The 0.1.1 build and Ubuntu installation instructions include the X11 keyboard
+runtime library required to open the application window. This corrects a
+missing prerequisite found while validating the 0.1.0 candidate.
 
 ## Upgrade
 

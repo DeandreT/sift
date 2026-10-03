@@ -44,7 +44,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dri libegl1 libvulkan1 mesa-vulkan-drivers xvfb x11-utils
+          sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dri libegl1 libvulkan1 mesa-vulkan-drivers xvfb xauth x11-utils
       - uses: actions-rust-lang/setup-rust-toolchain@ac90e63697ac2784f4ecfe2964e1a285c304003a # v1.14.1
         with:
           cache: true
@@ -73,10 +73,32 @@ jobs:
         if: runner.os == 'Linux'
         env:
           LIBGL_ALWAYS_SOFTWARE: "1"
-        run: xvfb-run -a python scripts/smoke-release.py target/release-artifacts/*.tar.gz
+        run: |
+          set -o pipefail
+          xvfb-run -a python scripts/smoke-release.py target/release-artifacts/*.tar.gz 2>&1 | tee packaged-smoke.log
       - name: Verify distributed Windows binary
         if: runner.os == 'Windows'
-        run: python scripts/smoke-release.py target/release-artifacts/*.zip
+        run: |
+          set -o pipefail
+          python scripts/smoke-release.py target/release-artifacts/*.zip 2>&1 | tee packaged-smoke.log
+      - name: Record packaged startup failure diagnostics
+        if: failure()
+        run: |
+          python - <<'PY'
+          import html
+          import os
+          from pathlib import Path
+
+          path = Path("packaged-smoke.log")
+          if path.exists():
+              with path.open("rb") as log:
+                  log.seek(max(0, path.stat().st_size - 16384))
+                  tail = log.read().decode("utf-8", errors="replace")
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+                  summary.write("### Packaged startup failure diagnostics (last 16 KiB)\n\n<pre>")
+                  summary.write(html.escape(tail))
+                  summary.write("</pre>\n")
+          PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: sift-${{ matrix.target }}

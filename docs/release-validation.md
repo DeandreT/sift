@@ -7,10 +7,10 @@ issues. Self-skipped live tests count as not run.
 
 | Candidate | Value |
 | --- | --- |
-| Version | 0.1.0 development preview |
-| Implementation revision | [08bf590](https://github.com/DeandreT/sift/commit/08bf5909b1df31ab9c991e40c31bc24061624a04); tagged release revision is recorded in its manifest |
-| Windows archive checksum / workflow | Pending hosted build |
-| Linux archive checksum / workflow | Pending hosted build |
+| Version | 0.1.1 development preview candidate; supersedes the incomplete 0.1.0 candidate |
+| Implementation revision | Based on [4cbac0f](https://github.com/DeandreT/sift/commit/4cbac0f); the final tagged 0.1.1 revision is recorded in its archive manifest |
+| Windows archive checksum / workflow | Pending 0.1.1 hosted build |
+| Linux archive checksum / workflow | Pending 0.1.1 hosted build |
 | Disposable namespace | Pending authorized test credentials; omit secrets |
 | Published preview | Pending hosted artifacts, Azure validation, and interactive platform checks |
 
@@ -26,8 +26,8 @@ supported Ubuntu/Windows release matrix or any Azure connection.
 | Release scripts | Python syntax and archive layout/checksum/target/tag guards verified |
 | Config compatibility | Legacy-profile defaults and unsupported-schema overwrite protection verified in unit tests |
 | Graphical test environment | Official Arch Xvfb/xwininfo packages extracted under `/tmp`; private display startup verified without host installation |
-| Actual packaged release smoke | Pending local release build and archive check |
-| Local artifact ABI | Record the release binary's required glibc symbols; local Arch builds do not establish the Ubuntu 22.04 baseline |
+| Actual packaged release smoke | Optimized 08bf590 developer archive passes; see local evidence below |
+| Local artifact ABI | The Arch-built developer binary requires GLIBC_2.44; it does not establish the Ubuntu 22.04 baseline |
 
 ## Local development evidence — 2026-10-02
 
@@ -55,9 +55,39 @@ supported Ubuntu/Windows or live Azure gates below.
   It is an Arch-built developer artifact, not the Ubuntu distribution binary;
   use the hosted Ubuntu 22.04 build for the supported Linux release.
 
+## Hosted evidence for the superseded 0.1.0 candidate
+
+The original `v0.1.0` tag points to `4cbac0f`. It remains unchanged; the corrected
+release candidate uses version 0.1.1 and a new matching tag. These results
+establish progress on the previous candidate, not completion of the 0.1.1 gates.
+
+- Hosted formatting, strict Clippy, unit tests, and workspace builds passed on
+  Windows and Linux in both the
+  [main CI run](https://github.com/DeandreT/sift/actions/runs/37080038909) and
+  [tag CI run](https://github.com/DeandreT/sift/actions/runs/37080038640).
+- The Windows job in the
+  [Desktop release run](https://github.com/DeandreT/sift/actions/runs/37080038632)
+  built and packaged the executable, then passed archive, headless configuration,
+  and visible-window smoke checks. Windows 11 interactive validation remains open.
+- The Linux job in that release run failed its distributed-binary smoke check.
+  The detailed hosted log was unavailable, so its exact error is not established.
+  An isolated local reproduction blocked loading the X11 runtime library
+  `libxkbcommon-x11.so`: headless configuration checks passed, then startup
+  panicked with "Library libxkbcommon-x11.so could not be loaded." (application
+  exit 101; smoke wrapper exit 1). The identical optimized archive and private
+  Xvfb display passed configuration and visible-window checks when normal
+  library access was restored. The 0.1.1 workflow and installation instructions
+  add Ubuntu's `libxkbcommon-x11-0` package, and the workflow explicitly installs
+  `xauth` for the Xvfb wrapper. Missing X11 runtime support remains an inferred
+  hosted cause; a fresh successful Ubuntu release run is still required.
+
+The failed Linux release job prevented a complete two-platform draft release.
+Hosted startup checks do not establish credential-store persistence, an Azure
+connection, or interactive behavior on the supported desktop systems.
+
 ## Automation
 
-- [ ] Format, Clippy, unit tests, and build pass for the candidate on both
+- [ ] Format, Clippy, unit tests, and build pass for the final 0.1.1 candidate on both
   Windows and Linux.
 - [ ] Both versioned archives are generated with matching source/version
   metadata, license, documentation, and SHA-256 sidecars.

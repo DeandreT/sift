@@ -4474,7 +4474,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "sift"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -4497,7 +4497,7 @@ dependencies = [
 
 [[package]]
 name = "sift-backend"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "azservicebus",
  "azure_core",
@@ -4517,7 +4517,7 @@ dependencies = [
 
 [[package]]
 name = "sift-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "directories",
@@ -4541,7 +4541,7 @@ dependencies = [
 
 [[package]]
 name = "sift-mgmt"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "azure_core",
@@ -4563,7 +4563,7 @@ dependencies = [
 
 [[package]]
 name = "sift-web-demo"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "eframe",
  "egui",

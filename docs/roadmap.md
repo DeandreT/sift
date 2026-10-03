@@ -3,11 +3,12 @@
 Sift is a native Azure Service Bus explorer. The feature work below is
 implemented in the development preview; release publication still depends on
 live Azure and supported-platform validation. Checked items have implementation
-and local evidence. Open items require the external evidence described in
-[release validation](release-validation.md).
+and local or linked hosted evidence. Open items require the external evidence
+described in [release validation](release-validation.md).
 
-Milestones remain in priority order without target dates. The package remains
-version 0.1.0 until release validation supports a stable release.
+Milestones remain in priority order without target dates. The current preview
+candidate is 0.1.1, which supersedes the incomplete 0.1.0 release candidate.
+The application remains pre-1.0 until release validation supports a stable release.
 
 ## Completed Foundation
 
@@ -30,11 +31,18 @@ version 0.1.0 until release validation supports a stable release.
 - [x] Automate versioned Windows and Linux builds, archives, checksums, and
   packaged startup checks, with draft preview releases on matching version tags.
 - [x] Prepare release notes, installation instructions, and known limitations.
-- [ ] Run the hosted Windows and Ubuntu release jobs and validate installation,
-  startup, credential storage, and connection setup on both platforms.
+- [ ] Run the hosted Windows and Ubuntu release jobs for the 0.1.1 candidate and
+  validate installation, startup, credential storage, and connection setup on
+  both platforms.
 - [ ] Validate core management and messaging against a disposable Azure Service
   Bus namespace using the gated live-validation workflow.
 - [ ] Publish the validated preview artifacts and documentation on GitHub.
+
+The previous candidate passed hosted Windows and Linux CI, and its Windows
+archive passed packaged startup checks. Its Linux release smoke check failed;
+the 0.1.1 candidate adds a missing Linux runtime dependency identified through
+an isolated reproduction. Fresh release jobs remain required. See the
+[validation record](release-validation.md) for run links and evidence limits.
 
 ### 2 Microsoft Entra ID Authentication
 

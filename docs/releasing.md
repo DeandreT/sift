@@ -44,11 +44,11 @@ and ordinary jobs have read-only repository access. This follows
 ## Create the downloadable preview
 
 Set `[workspace.package].version` in `Cargo.toml` to the intended release
-version, update `Cargo.lock`, and use a matching tag such as `v0.1.0`.
+version, update `Cargo.lock`, and use a matching tag such as `v0.1.1`.
 
 ```sh
-git tag -a v0.1.0 -m 'Sift 0.1.0 preview'
-git push origin v0.1.0
+git tag -a v0.1.1 -m 'Sift 0.1.1 preview'
+git push origin v0.1.1
 ```
 
 The package job rejects mismatched tags, builds with `--locked`, checks the
@@ -56,6 +56,12 @@ actual executable format and architecture, and tests the extracted archive.
 On success, the draft job attaches the archives and checksum sidecars to a
 draft pre-release using the release notes in the tagged source. Re-running the
 workflow can refresh a draft; it refuses to replace already published assets.
+
+If a tagged candidate needs a source or workflow fix, preserve that tag and
+commit history. Increment the preview patch version and create a new matching
+tag for the corrected candidate. The 0.1.1 candidate follows the failed 0.1.0
+Linux window check; it adds the X11 keyboard runtime library to the build and
+installation prerequisites.
 
 Review the draft's notes and recorded validation, then publish that pre-release
 in GitHub. Creating the workflow files locally does not create a release;
@@ -73,7 +79,7 @@ cargo build --locked --release -p sift
 python3 scripts/package-release.py --binary target/release/sift \
   --target x86_64-unknown-linux-gnu
 python3 scripts/smoke-release.py \
-  target/release-artifacts/sift-0.1.0-x86_64-unknown-linux-gnu.tar.gz \
+  target/release-artifacts/sift-0.1.1-x86_64-unknown-linux-gnu.tar.gz \
   --headless-only
 ```
 
