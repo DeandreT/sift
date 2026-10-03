@@ -8,11 +8,12 @@ issues. Self-skipped live tests count as not run.
 | Candidate | Value |
 | --- | --- |
 | Version | 0.1.1 development preview candidate; supersedes the incomplete 0.1.0 candidate |
-| Implementation revision | Based on [4cbac0f](https://github.com/DeandreT/sift/commit/4cbac0f); the final tagged 0.1.1 revision is recorded in its archive manifest |
-| Windows archive checksum / workflow | Pending 0.1.1 hosted build |
-| Linux archive checksum / workflow | Pending 0.1.1 hosted build |
+| Implementation revision | Clean tagged source [aef0320](https://github.com/DeandreT/sift/commit/aef03208691b6cc86a1e89fb07548b6aa1fba512), `v0.1.1`; full revision `aef03208691b6cc86a1e89fb07548b6aa1fba512` |
+| Windows archive checksum / workflow | Package, SHA-256 verification, configuration/window smoke, and artifact upload passed in the [0.1.1 Desktop release run](https://github.com/DeandreT/sift/actions/runs/37082184197); literal archive checksum not yet retrieved |
+| Linux archive checksum / workflow | Package, SHA-256 verification, configuration/window smoke, and artifact upload passed in the [0.1.1 Desktop release run](https://github.com/DeandreT/sift/actions/runs/37082184197); literal archive checksum not yet retrieved |
 | Disposable namespace | Pending authorized test credentials; omit secrets |
-| Published preview | Pending hosted artifacts, Azure validation, and interactive platform checks |
+| Draft preview | Created with both archives and SHA-256 sidecars by the successful [tagged release job](https://github.com/DeandreT/sift/actions/runs/37082184197) |
+| Published preview | Not yet public; pending Azure validation and interactive platform checks |
 
 ## Local implementation evidence
 
@@ -55,6 +56,41 @@ supported Ubuntu/Windows or live Azure gates below.
   It is an Arch-built developer artifact, not the Ubuntu distribution binary;
   use the hosted Ubuntu 22.04 build for the supported Linux release.
 
+## Hosted evidence for the 0.1.1 candidate
+
+The clean `v0.1.1` source is
+`aef03208691b6cc86a1e89fb07548b6aa1fba512`.
+
+- Hosted formatting, strict Clippy, unit tests, and workspace builds passed on
+  Windows and Ubuntu in both the
+  [main CI run](https://github.com/DeandreT/sift/actions/runs/37082160946) and
+  [tag CI run](https://github.com/DeandreT/sift/actions/runs/37082184189).
+- The [Site run](https://github.com/DeandreT/sift/actions/runs/37082160979)
+  successfully built and deployed the documentation and browser demo to
+  [GitHub Pages](https://deandret.github.io/sift/).
+- Both platform jobs in the
+  [Desktop release run](https://github.com/DeandreT/sift/actions/runs/37082184197)
+  successfully built and packaged the optimized Ubuntu 22.04 and Windows executables,
+  verified archive and member SHA-256 checksums, passed isolated headless
+  configuration/save and visible-window smoke checks, and uploaded their artifacts.
+  Both literal distribution archive checksums remain unretrieved because artifact
+  downloads require authenticated access. Outer GitHub artifact ZIP digests are
+  not the distribution archive checksums.
+- The tagged draft-release job also passed and created the draft pre-release
+  with both platform archives and their verified SHA-256 sidecars attached.
+  The workflow completed successfully. The draft has not been publicly published.
+
+The automated source, archive, and packaged-startup gates are complete. These
+results do not establish Azure behavior, interactive desktop validation,
+credential-store persistence, or public publication.
+
+The hosted live-validation workflow supplies SAS credentials. Its Entra test
+self-skips unless separate Azure CLI sign-in and Entra namespace access are
+provided; a successful SAS run does not validate Entra. The session live suite
+tests settlement and stale local leases. Actual broker expiry, ownership loss,
+and lock reacquisition after disconnect/shutdown still require the interactive
+session checks below.
+
 ## Hosted evidence for the superseded 0.1.0 candidate
 
 The original `v0.1.0` tag points to `4cbac0f`. It remains unchanged; the corrected
@@ -79,7 +115,8 @@ establish progress on the previous candidate, not completion of the 0.1.1 gates.
   library access was restored. The 0.1.1 workflow and installation instructions
   add Ubuntu's `libxkbcommon-x11-0` package, and the workflow explicitly installs
   `xauth` for the Xvfb wrapper. Missing X11 runtime support remains an inferred
-  hosted cause; a fresh successful Ubuntu release run is still required.
+  hosted cause; the corrected 0.1.1 Ubuntu release check subsequently passed,
+  as recorded above.
 
 The failed Linux release job prevented a complete two-platform draft release.
 Hosted startup checks do not establish credential-store persistence, an Azure
@@ -87,14 +124,15 @@ connection, or interactive behavior on the supported desktop systems.
 
 ## Automation
 
-- [ ] Format, Clippy, unit tests, and build pass for the final 0.1.1 candidate on both
+- [x] Format, Clippy, unit tests, and build pass for the final 0.1.1 candidate on both
   Windows and Linux.
-- [ ] Both versioned archives are generated with matching source/version
+- [x] Both versioned archives are generated with matching source/version
   metadata, license, documentation, and SHA-256 sidecars.
-- [ ] The extracted Windows and Linux binaries pass headless configuration
+- [x] The extracted Windows and Linux binaries pass headless configuration
   smoke checks and create visible desktop windows.
-- [ ] Mutation-enabled live tests run against a disposable namespace on both
-  Windows and Linux with no silently skipped credentials.
+- [ ] Mutation-enabled SAS live tests run against a disposable namespace on
+  both Windows and Linux with no skipped SAS credentials; record separate
+  Entra validation in the interactive authentication check below.
 
 ## Interactive platform validation
 
@@ -133,7 +171,7 @@ checksum, result, and any issue link beside the item.
 
 - [ ] Resolve every release-blocking issue found in automation and desktop
   validation; link the fixes and affected rechecks.
-- [ ] Review release notes, installation instructions, support matrix, and
+- [x] Review release notes, installation instructions, support matrix, and
   compatibility policy against the tested candidate.
 - [ ] Publish the preview with both platform archives and checksum files;
   record its release URL above.

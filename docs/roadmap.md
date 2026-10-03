@@ -31,18 +31,21 @@ The application remains pre-1.0 until release validation supports a stable relea
 - [x] Automate versioned Windows and Linux builds, archives, checksums, and
   packaged startup checks, with draft preview releases on matching version tags.
 - [x] Prepare release notes, installation instructions, and known limitations.
-- [ ] Run the hosted Windows and Ubuntu release jobs for the 0.1.1 candidate and
-  validate installation, startup, credential storage, and connection setup on
-  both platforms.
+- [x] Run the hosted Windows and Ubuntu release jobs for the 0.1.1 candidate;
+  verify archives, checksums, packaged configuration/window startup, and draft
+  release creation.
+- [ ] Validate interactive installation, startup, credential storage, and
+  connection setup on both supported desktop platforms.
 - [ ] Validate core management and messaging against a disposable Azure Service
   Bus namespace using the gated live-validation workflow.
 - [ ] Publish the validated preview artifacts and documentation on GitHub.
 
-The previous candidate passed hosted Windows and Linux CI, and its Windows
-archive passed packaged startup checks. Its Linux release smoke check failed;
-the 0.1.1 candidate adds a missing Linux runtime dependency identified through
-an isolated reproduction. Fresh release jobs remain required. See the
-[validation record](release-validation.md) for run links and evidence limits.
+The 0.1.1 candidate passed hosted Windows and Linux CI and both platform release
+jobs, including archive verification and packaged startup. The workflow created
+a draft preview with both archives and checksum sidecars. Public publication,
+live Azure checks, and interactive desktop validation remain open. The Linux
+runtime fix and the incomplete 0.1.0 candidate remain documented in the
+[validation record](release-validation.md), with run links and evidence limits.
 
 ### 2 Microsoft Entra ID Authentication
 
